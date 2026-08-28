@@ -80,17 +80,18 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Read [`CONTRIBUTING.md`](CONTRIBUTING.md) for the repository workflow. Product
-scope, architectural invariants, and the approved roadmap are documented in
-[`PRODUCT.md`](PRODUCT.md), [`ARCHITECTURE.md`](ARCHITECTURE.md), and
-[`PLAN.md`](PLAN.md).
+Product scope and architectural invariants are documented in
+[`PRODUCT.md`](PRODUCT.md) and [`ARCHITECTURE.md`](ARCHITECTURE.md). Review
+[`SECURITY.md`](SECURITY.md), [`SUPPORT.md`](SUPPORT.md),
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md), and the
+[release process](.github/RELEASE_PROCESS.md) before participating in the
+project.
 
 ### Status and roadmap
 
 The initial non-streaming OpenAI-compatible slice is implemented. Streaming,
 additional inbound protocols, provider-native quota synchronization, billing
-reconciliation, and distribution automation remain roadmap work. See
-[`PLAN.md`](PLAN.md) for the tracked sequence.
+reconciliation, and distribution automation remain roadmap work.
 
 ### License
 
@@ -175,16 +176,19 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Leia [`CONTRIBUTING.md`](CONTRIBUTING.md) para o fluxo do repositório. Escopo,
-invariantes arquiteturais e roadmap aprovado estão em [`PRODUCT.md`](PRODUCT.md),
-[`ARCHITECTURE.md`](ARCHITECTURE.md) e [`PLAN.md`](PLAN.md).
+O escopo do produto e as invariantes arquiteturais estão em
+[`PRODUCT.md`](PRODUCT.md) e [`ARCHITECTURE.md`](ARCHITECTURE.md). Consulte
+[`SECURITY.md`](SECURITY.md), [`SUPPORT.md`](SUPPORT.md),
+[`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md) e o
+[processo de release](.github/RELEASE_PROCESS.md) antes de participar do
+projeto.
 
 ### Status e roadmap
 
 A fatia inicial não streaming compatível com OpenAI está implementada.
 Streaming, protocolos de entrada adicionais, sincronização de cotas nativas dos
 provedores, reconciliação de cobrança e automação de distribuição continuam no
-roadmap. Consulte [`PLAN.md`](PLAN.md) para a sequência acompanhada.
+roadmap.
 
 ### Licença
 
