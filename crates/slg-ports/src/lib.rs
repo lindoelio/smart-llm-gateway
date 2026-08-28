@@ -1,10 +1,14 @@
 //! Ports for persistence, credentials, and one outbound inference attempt.
 
 use async_trait::async_trait;
-use slg_domain::{CredentialReference, InferenceRequest, ProviderFailure, RouteCandidate};
+use slg_domain::{
+    AttemptId, CredentialReference, InferenceRequest, ProviderFailure, RouteCandidate,
+};
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct AttemptRecord {
+    /// Stable across primary-persistence retries and spool reconciliation.
+    pub attempt_id: AttemptId,
     pub request_id: String,
     pub route_id: String,
     pub outcome: String,

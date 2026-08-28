@@ -237,7 +237,7 @@ impl ConfigurationRepository for SqliteStore {
     }
 
     async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), String> {
-        self.connection.lock().map_err(|_| "sqlite mutex poisoned".to_owned())?.execute("INSERT INTO usage_attempts (id, request_id, route_id, outcome, failure_category) VALUES (?1, ?2, ?3, ?4, ?5)", params![Uuid::new_v4().to_string(), attempt.request_id, attempt.route_id, attempt.outcome, attempt.failure_category]).map_err(|error| error.to_string())?;
+        self.connection.lock().map_err(|_| "sqlite mutex poisoned".to_owned())?.execute("INSERT INTO usage_attempts (id, request_id, route_id, outcome, failure_category) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING", params![attempt.attempt_id.to_string(), attempt.request_id, attempt.route_id, attempt.outcome, attempt.failure_category]).map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -287,6 +287,8 @@ impl ConfigurationRepository for SqliteStore {
 #[cfg(test)]
 mod tests {
     use rusqlite::params;
+    use slg_domain::AttemptId;
+    use slg_ports::AttemptRecord;
 
     use super::SqliteStore;
     use slg_ports::ConfigurationRepository;
@@ -353,5 +355,30 @@ mod tests {
             .unwrap_err();
         assert!(error.to_string().contains("CHECK constraint failed"));
         assert!(!error.to_string().contains(literal));
+    }
+
+    #[tokio::test]
+    async fn recording_the_same_attempt_is_idempotent() {
+        let store = SqliteStore::in_memory().unwrap();
+        let attempt = AttemptRecord {
+            attempt_id: AttemptId::new(),
+            request_id: "request".into(),
+            route_id: "route".into(),
+            outcome: "succeeded".into(),
+            failure_category: None,
+        };
+
+        store.record_attempt(attempt.clone()).await.unwrap();
+        store.record_attempt(attempt.clone()).await.unwrap();
+
+        let connection = store.connection.lock().unwrap();
+        let count: i64 = connection
+            .query_row(
+                "SELECT COUNT(*) FROM usage_attempts WHERE id = ?1",
+                [attempt.attempt_id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }

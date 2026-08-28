@@ -24,6 +24,35 @@ pub struct InferenceRequest {
     pub max_tokens: Option<u32>,
 }
 
+/// Immutable identity for one provider-attempt outcome.
+///
+/// The application creates this identifier before attempting primary
+/// persistence. It travels with the attempt through the durable spool, so a
+/// recovery worker can safely retry delivery after a process restart without
+/// charging the same outcome more than once.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(transparent)]
+pub struct AttemptId(Uuid);
+
+impl AttemptId {
+    #[must_use]
+    pub fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+impl std::fmt::Display for AttemptId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(formatter)
+    }
+}
+
+impl Default for AttemptId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// A normalized reference to an environment variable that holds a credential.
 ///
 /// Credential values are not valid configuration data. Keeping this as a

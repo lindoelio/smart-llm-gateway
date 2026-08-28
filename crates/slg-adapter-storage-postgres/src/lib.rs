@@ -475,7 +475,7 @@ impl ConfigurationRepository for PostgresStore {
     }
 
     async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), String> {
-        self.client.lock().await.execute("INSERT INTO usage_attempts (id, request_id, route_id, outcome, failure_category) VALUES ($1, $2, $3, $4, $5)", &[&Uuid::new_v4().to_string(), &attempt.request_id, &attempt.route_id, &attempt.outcome, &attempt.failure_category]).await.map_err(|error| error.to_string())?;
+        self.client.lock().await.execute("INSERT INTO usage_attempts (id, request_id, route_id, outcome, failure_category) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING", &[&attempt.attempt_id.to_string(), &attempt.request_id, &attempt.route_id, &attempt.outcome, &attempt.failure_category]).await.map_err(|error| error.to_string())?;
         Ok(())
     }
 
@@ -644,5 +644,34 @@ mod tests {
             );
             assert!(!error.to_string().contains(literal));
         }
+    }
+
+    #[tokio::test]
+    async fn postgres_records_the_same_attempt_once() {
+        let Some(url) = integration_url() else {
+            return;
+        };
+        let store = PostgresStore::connect(&url).await.unwrap();
+        let attempt = AttemptRecord {
+            attempt_id: slg_domain::AttemptId::new(),
+            request_id: unique("attempt-request"),
+            route_id: unique("attempt-route"),
+            outcome: "succeeded".into(),
+            failure_category: None,
+        };
+
+        store.record_attempt(attempt.clone()).await.unwrap();
+        store.record_attempt(attempt.clone()).await.unwrap();
+
+        let client = store.client.lock().await;
+        let count: i64 = client
+            .query_one(
+                "SELECT COUNT(*) FROM usage_attempts WHERE id = $1",
+                &[&attempt.attempt_id.to_string()],
+            )
+            .await
+            .unwrap()
+            .get(0);
+        assert_eq!(count, 1);
     }
 }

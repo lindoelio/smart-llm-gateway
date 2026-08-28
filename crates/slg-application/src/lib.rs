@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use slg_domain::InferenceRequest;
+use slg_domain::{AttemptId, InferenceRequest};
 use slg_ports::{
     AttemptRecord, ConfigurationRepository, InferenceExecutor, SecretResolver, UsageSpool,
 };
@@ -122,6 +122,7 @@ where
             match self.executor.execute(&route, &request, &credential).await {
                 Ok(response) => {
                     self.persist_attempt(AttemptRecord {
+                        attempt_id: AttemptId::new(),
                         request_id: request.request_id.to_string(),
                         route_id: route.route_id.clone(),
                         outcome: "succeeded".into(),
@@ -137,6 +138,7 @@ where
                 Err(failure) => {
                     let category = format!("{:?}", failure.category);
                     self.persist_attempt(AttemptRecord {
+                        attempt_id: AttemptId::new(),
                         request_id: request.request_id.to_string(),
                         route_id: route.route_id.clone(),
                         outcome: "failed".into(),
@@ -385,6 +387,7 @@ mod tests {
         assert_eq!(attempts.len(), 2);
         assert_eq!(attempts[0].outcome, "failed");
         assert_eq!(attempts[1].outcome, "succeeded");
+        assert_ne!(attempts[0].attempt_id, attempts[1].attempt_id);
     }
 
     #[tokio::test]

@@ -200,7 +200,7 @@ impl DurableUsageSpool {
 
     pub fn append(&self, attempt: AttemptRecord) -> Result<String, String> {
         let entry = SpoolEntry {
-            id: Uuid::new_v4().to_string(),
+            id: attempt.attempt_id.to_string(),
             attempt,
         };
         let payload = serde_json::to_string(&entry).map_err(|error| error.to_string())?;
@@ -208,7 +208,7 @@ impl DurableUsageSpool {
             .lock()
             .map_err(|_| "usage spool mutex poisoned".to_owned())?
             .execute(
-                "INSERT INTO usage_spool (id, payload) VALUES (?1, ?2)",
+                "INSERT INTO usage_spool (id, payload) VALUES (?1, ?2) ON CONFLICT(id) DO NOTHING",
                 params![entry.id, payload],
             )
             .map_err(|error| error.to_string())?;
@@ -655,17 +655,26 @@ mod tests {
     fn spool_delivers_at_least_once_until_acknowledged() {
         let path = path("spool");
         let spool = DurableUsageSpool::open(&path).unwrap();
-        let id = spool
-            .append(AttemptRecord {
-                request_id: "request".into(),
-                route_id: "route".into(),
-                outcome: "succeeded".into(),
-                failure_category: None,
-            })
-            .unwrap();
-        assert_eq!(spool.pending(10).unwrap().len(), 1);
-        spool.acknowledge(&[id]).unwrap();
-        assert!(spool.pending(10).unwrap().is_empty());
+        let attempt = AttemptRecord {
+            attempt_id: slg_domain::AttemptId::new(),
+            request_id: "request".into(),
+            route_id: "route".into(),
+            outcome: "succeeded".into(),
+            failure_category: None,
+        };
+        let id = spool.append(attempt.clone()).unwrap();
+        // The same outcome can be re-enqueued after a crash/retry, but must
+        // retain one durable item until the primary store acknowledges it.
+        assert_eq!(spool.append(attempt).unwrap(), id);
+        drop(spool);
+
+        let recovered = DurableUsageSpool::open(&path).unwrap();
+        let pending = recovered.pending(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, id);
+        recovered.acknowledge(&[id]).unwrap();
+        assert!(recovered.pending(10).unwrap().is_empty());
+        drop(recovered);
         fs::remove_file(path).unwrap();
     }
 
@@ -683,6 +692,7 @@ mod tests {
         );
         snapshot
             .record_attempt(AttemptRecord {
+                attempt_id: slg_domain::AttemptId::new(),
                 request_id: "attempt-a".into(),
                 route_id: "route-a".into(),
                 outcome: "succeeded".into(),
