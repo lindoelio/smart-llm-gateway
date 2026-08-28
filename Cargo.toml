@@ -1,0 +1,51 @@
+[workspace]
+resolver = "3"
+members = [
+  "crates/slg-domain",
+  "crates/slg-ports",
+  "crates/slg-application",
+  "crates/slg-adapter-inbound-openai",
+  "crates/slg-adapter-upstream-openai",
+  "crates/slg-adapter-provider",
+  "crates/slg-adapter-storage-sqlite",
+  "crates/slg-adapter-storage-postgres",
+  "crates/slg-adapter-secrets",
+  "crates/slg-runtime",
+  "crates/smart-llm-gateway",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.91"
+license = "Apache-2.0"
+repository = "https://github.com/lindoelio/smart-llm-gateway"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+unused_must_use = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+doc_markdown = "allow"
+missing_errors_doc = "allow"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+axum = "0.8.8"
+clap = { version = "4.5.60", features = ["derive"] }
+futures-util = "0.3.31"
+hex = "0.4.3"
+http = "1.4.0"
+rand = "0.9.2"
+reqwest = { version = "0.12.28", default-features = false, features = ["json", "rustls-tls", "stream"] }
+rusqlite = { version = "0.38.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+sha2 = "0.10.9"
+thiserror = "2.0.18"
+tokio = { version = "1.48.0", features = ["macros", "rt-multi-thread", "signal", "sync", "time", "net"] }
+tokio-postgres = "0.7.16"
+tower-http = { version = "0.6.8", features = ["trace"] }
+uuid = { version = "1.19.0", features = ["v4", "serde"] }

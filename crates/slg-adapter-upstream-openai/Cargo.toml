@@ -1,0 +1,13 @@
+[package]
+name = "slg-adapter-upstream-openai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+serde_json.workspace = true
+slg-domain = { path = "../slg-domain" }
+
+[lints]
+workspace = true

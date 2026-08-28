@@ -1,0 +1,16 @@
+/target/
+/.smart-llm-gateway/
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal
+.env
+
+# Local internal operating material is deliberately kept out of the public
+# open-source repository.
+/.linkel-ai-team/
+/.opencode/
+/opencode.json
+/company/
+/AGENTS.md
+/CONTRIBUTING.md
+/PLAN.md

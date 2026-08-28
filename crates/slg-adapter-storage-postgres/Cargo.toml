@@ -1,0 +1,22 @@
+[package]
+name = "slg-adapter-storage-postgres"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+sha2.workspace = true
+slg-domain = { path = "../slg-domain" }
+slg-ports = { path = "../slg-ports" }
+thiserror.workspace = true
+tokio.workspace = true
+tokio-postgres.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+slg-adapter-storage-sqlite = { path = "../slg-adapter-storage-sqlite" }
+
+[lints]
+workspace = true

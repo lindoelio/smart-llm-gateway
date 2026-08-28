@@ -1,0 +1,25 @@
+[package]
+name = "smart-llm-gateway"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "gateway"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+serde_json.workspace = true
+slg-adapter-inbound-openai = { path = "../slg-adapter-inbound-openai" }
+slg-adapter-provider = { path = "../slg-adapter-provider" }
+slg-adapter-secrets = { path = "../slg-adapter-secrets" }
+slg-adapter-storage-postgres = { path = "../slg-adapter-storage-postgres" }
+slg-adapter-storage-sqlite = { path = "../slg-adapter-storage-sqlite" }
+slg-application = { path = "../slg-application" }
+slg-runtime = { path = "../slg-runtime" }
+tokio.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "slg-adapter-inbound-openai"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+slg-application = { path = "../slg-application" }
+slg-domain = { path = "../slg-domain" }
+slg-ports = { path = "../slg-ports" }
+uuid.workspace = true
+
+[lints]
+workspace = true

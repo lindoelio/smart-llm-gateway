@@ -1,0 +1,17 @@
+[package]
+name = "slg-adapter-provider"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+async-trait.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+slg-adapter-upstream-openai = { path = "../slg-adapter-upstream-openai" }
+slg-domain = { path = "../slg-domain" }
+slg-ports = { path = "../slg-ports" }
+
+[lints]
+workspace = true
