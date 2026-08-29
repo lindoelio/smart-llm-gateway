@@ -902,6 +902,117 @@ mod tests {
             .unwrap();
     }
 
+    fn configure_sqlite_route(sqlite: &SqliteStore, model: &str, account: &str, route: &str) {
+        sqlite.create_model(model).unwrap();
+        sqlite
+            .create_account(
+                account,
+                "openai-compatible",
+                "env:POSTGRES_TEST_PROVIDER_KEY",
+                "https://provider.example.test",
+            )
+            .unwrap();
+        sqlite
+            .create_route(route, model, account, "upstream-model", 1)
+            .unwrap();
+    }
+
+    fn authoritative_quota_snapshot(account: &str) -> ProviderQuotaSnapshot {
+        ProviderQuotaSnapshot {
+            snapshot_id: unique("quota-snapshot"),
+            provider_account_id: account.into(),
+            constraint_id: "daily-input-tokens".into(),
+            unit: ProviderUnit {
+                kind: ProviderUnitKind::InputTokens,
+                currency_code: None,
+                custom_name: None,
+            },
+            allowance: Some(FixedDecimal {
+                unscaled: 1_000_000,
+                scale: 0,
+            }),
+            consumed: Some(FixedDecimal {
+                unscaled: 123_456,
+                scale: 0,
+            }),
+            remaining: None,
+            reset_at_unix: Some(1_700_003_600),
+            observed_at_unix: 1_700_000_000,
+            fresh_until_unix: 1_700_000_300,
+            source: AuthoritativeSource {
+                source_id: "provider-quota-endpoint".into(),
+                evidence_version: Some("2026-08".into()),
+            },
+        }
+    }
+
+    fn authoritative_billing_record(account: &str, attempt_id: AttemptId) -> ProviderBillingRecord {
+        ProviderBillingRecord {
+            record_id: unique("billing-record"),
+            attempt_id,
+            provider_account_id: account.into(),
+            provider_request_id: Some("provider-request-opaque-id".into()),
+            billed_units: vec![
+                ProviderReportedQuantity {
+                    unit: ProviderUnit {
+                        kind: ProviderUnitKind::InputTokens,
+                        currency_code: None,
+                        custom_name: None,
+                    },
+                    value: FixedDecimal {
+                        unscaled: 321,
+                        scale: 0,
+                    },
+                },
+                ProviderReportedQuantity {
+                    unit: ProviderUnit {
+                        kind: ProviderUnitKind::Custom,
+                        currency_code: None,
+                        custom_name: Some("provider_compute_units".into()),
+                    },
+                    value: FixedDecimal {
+                        unscaled: 75,
+                        scale: 2,
+                    },
+                },
+            ],
+            charge: Some(ProviderReportedQuantity {
+                unit: ProviderUnit {
+                    kind: ProviderUnitKind::Currency,
+                    currency_code: Some("USD".into()),
+                    custom_name: None,
+                },
+                value: FixedDecimal {
+                    unscaled: 1234,
+                    scale: 4,
+                },
+            }),
+            observed_at_unix: 1_700_000_010,
+            fresh_until_unix: 1_700_000_310,
+            source: AuthoritativeSource {
+                source_id: "provider-billing-export".into(),
+                evidence_version: Some("v3".into()),
+            },
+        }
+    }
+
+    async fn record_authoritative_accounting_in_both_stores(
+        postgres: &PostgresStore,
+        sqlite: &SqliteStore,
+        snapshot: ProviderQuotaSnapshot,
+        billing: ProviderBillingRecord,
+    ) {
+        for store in [
+            postgres as &dyn AuthoritativeAccountingRepository,
+            sqlite as &dyn AuthoritativeAccountingRepository,
+        ] {
+            store.record_quota_snapshot(snapshot.clone()).await.unwrap();
+            store.record_quota_snapshot(snapshot.clone()).await.unwrap();
+            store.record_billing_record(billing.clone()).await.unwrap();
+            store.record_billing_record(billing.clone()).await.unwrap();
+        }
+    }
+
     #[tokio::test]
     async fn postgres_lease_is_exclusive_and_candidate_order_matches_sqlite() {
         let Some(url) = integration_url() else {
@@ -1037,18 +1148,7 @@ mod tests {
         let account = unique("accounting-account");
         let route = unique("accounting-route");
         configure_route(&postgres, &model, &account, &route).await;
-        sqlite.create_model(&model).unwrap();
-        sqlite
-            .create_account(
-                &account,
-                "openai-compatible",
-                "env:POSTGRES_TEST_PROVIDER_KEY",
-                "https://provider.example.test",
-            )
-            .unwrap();
-        sqlite
-            .create_route(&route, &model, &account, "upstream-model", 1)
-            .unwrap();
+        configure_sqlite_route(&sqlite, &model, &account, &route);
 
         let attempt = AttemptRecord {
             attempt_id: AttemptId::new(),
@@ -1060,86 +1160,13 @@ mod tests {
         postgres.record_attempt(attempt.clone()).await.unwrap();
         sqlite.record_attempt(attempt.clone()).await.unwrap();
 
-        let snapshot = ProviderQuotaSnapshot {
-            snapshot_id: unique("quota-snapshot"),
-            provider_account_id: account.clone(),
-            constraint_id: "daily-input-tokens".into(),
-            unit: ProviderUnit {
-                kind: ProviderUnitKind::InputTokens,
-                currency_code: None,
-                custom_name: None,
-            },
-            allowance: Some(FixedDecimal {
-                unscaled: 1_000_000,
-                scale: 0,
-            }),
-            consumed: Some(FixedDecimal {
-                unscaled: 123_456,
-                scale: 0,
-            }),
-            remaining: None,
-            reset_at_unix: Some(1_700_003_600),
-            observed_at_unix: 1_700_000_000,
-            fresh_until_unix: 1_700_000_300,
-            source: AuthoritativeSource {
-                source_id: "provider-quota-endpoint".into(),
-                evidence_version: Some("2026-08".into()),
-            },
-        };
-        let billing = ProviderBillingRecord {
-            record_id: unique("billing-record"),
-            attempt_id: attempt.attempt_id.clone(),
-            provider_account_id: account.clone(),
-            provider_request_id: Some("provider-request-opaque-id".into()),
-            billed_units: vec![
-                ProviderReportedQuantity {
-                    unit: ProviderUnit {
-                        kind: ProviderUnitKind::InputTokens,
-                        currency_code: None,
-                        custom_name: None,
-                    },
-                    value: FixedDecimal {
-                        unscaled: 321,
-                        scale: 0,
-                    },
-                },
-                ProviderReportedQuantity {
-                    unit: ProviderUnit {
-                        kind: ProviderUnitKind::Custom,
-                        currency_code: None,
-                        custom_name: Some("provider_compute_units".into()),
-                    },
-                    value: FixedDecimal {
-                        unscaled: 75,
-                        scale: 2,
-                    },
-                },
-            ],
-            charge: Some(ProviderReportedQuantity {
-                unit: ProviderUnit {
-                    kind: ProviderUnitKind::Currency,
-                    currency_code: Some("USD".into()),
-                    custom_name: None,
-                },
-                value: FixedDecimal {
-                    unscaled: 1234,
-                    scale: 4,
-                },
-            }),
-            observed_at_unix: 1_700_000_010,
-            fresh_until_unix: 1_700_000_310,
-            source: AuthoritativeSource {
-                source_id: "provider-billing-export".into(),
-                evidence_version: Some("v3".into()),
-            },
-        };
-
-        for store in [&postgres as &dyn AuthoritativeAccountingRepository, &sqlite] {
-            store.record_quota_snapshot(snapshot.clone()).await.unwrap();
-            store.record_quota_snapshot(snapshot.clone()).await.unwrap();
-            store.record_billing_record(billing.clone()).await.unwrap();
-            store.record_billing_record(billing.clone()).await.unwrap();
-        }
+        record_authoritative_accounting_in_both_stores(
+            &postgres,
+            &sqlite,
+            authoritative_quota_snapshot(&account),
+            authoritative_billing_record(&account, attempt.attempt_id.clone()),
+        )
+        .await;
 
         assert_eq!(
             postgres.quota_snapshots(&account).await.unwrap(),

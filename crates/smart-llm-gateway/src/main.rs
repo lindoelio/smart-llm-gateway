@@ -366,6 +366,7 @@ async fn serve(arguments: ServeArgs) -> Result<(), String> {
         println!("{{\"listening\":\"{}\"}}", arguments.bind);
         match open_store(&arguments.database).await? {
             Store::Sqlite(store) => {
+                let accounting = store.clone();
                 slg_runtime::serve(
                     slg_adapter_inbound_openai::router(Arc::new(
                         Gateway::new(
@@ -373,7 +374,8 @@ async fn serve(arguments: ServeArgs) -> Result<(), String> {
                             OpenAiCompatibleExecutor::new(),
                             EnvironmentSecretResolver,
                         )
-                        .with_usage_spool(spool),
+                        .with_usage_spool(spool)
+                        .with_accounting_repository(accounting),
                     )),
                     arguments.bind,
                 )
@@ -392,6 +394,7 @@ async fn serve_postgres(
         slg_runtime::LastKnownGoodSnapshot::new(arguments.state_dir.join("last-known-good.json"));
     match PostgresStore::connect(&arguments.database).await {
         Ok(primary) => {
+            let accounting = primary.clone();
             let snapshot = control_snapshot(primary.control_snapshot_data().await?);
             snapshot_store.save(&snapshot)?;
             let fallback = slg_runtime::SnapshotRepository::new(snapshot, spool.clone());
@@ -402,11 +405,14 @@ async fn serve_postgres(
                 arguments.bind
             );
             slg_runtime::serve(
-                slg_adapter_inbound_openai::router(Arc::new(Gateway::new(
-                    slg_runtime::SnapshotFallback::new(primary, fallback),
-                    OpenAiCompatibleExecutor::new(),
-                    EnvironmentSecretResolver,
-                ))),
+                slg_adapter_inbound_openai::router(Arc::new(
+                    Gateway::new(
+                        slg_runtime::SnapshotFallback::new(primary, fallback),
+                        OpenAiCompatibleExecutor::new(),
+                        EnvironmentSecretResolver,
+                    )
+                    .with_accounting_repository(accounting),
+                )),
                 arguments.bind,
             )
             .await

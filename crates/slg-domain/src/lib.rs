@@ -217,6 +217,73 @@ impl ProviderBillingRecord {
     }
 }
 
+/// Provider-supplied billing facts from a single inference response.
+///
+/// This is intentionally narrower than [`ProviderBillingRecord`]: the
+/// application supplies the gateway attempt identity and the local observation
+/// timestamp, while the provider adapter supplies only values explicitly
+/// present in an upstream response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderBillingEvidence {
+    pub provider_request_id: Option<String>,
+    pub billed_units: Vec<ProviderReportedQuantity>,
+    pub charge: Option<ProviderReportedQuantity>,
+    pub source: AuthoritativeSource,
+}
+
+impl ProviderBillingEvidence {
+    pub fn validate(&self) -> Result<(), AuthoritativeDataError> {
+        self.source.validate()?;
+        if self.billed_units.is_empty() && self.charge.is_none() {
+            return Err(AuthoritativeDataError::MissingReportedValue);
+        }
+        for quantity in &self.billed_units {
+            quantity.validate()?;
+        }
+        if let Some(charge) = &self.charge {
+            charge.validate()?;
+            if charge.unit.kind != ProviderUnitKind::Currency {
+                return Err(AuthoritativeDataError::ChargeMustUseCurrency);
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Optional facts supplied by one provider inference response.
+///
+/// The gateway carries this evidence alongside the client response but never
+/// derives values from it. Quota observations retain their provider account
+/// identity so the application can reject cross-account contamination.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProviderAuthoritativeEvidence {
+    pub quota_snapshots: Vec<ProviderQuotaSnapshot>,
+    pub billing: Option<ProviderBillingEvidence>,
+}
+
+impl ProviderAuthoritativeEvidence {
+    pub fn validate_for_account(
+        &self,
+        provider_account_id: &str,
+    ) -> Result<(), AuthoritativeDataError> {
+        for snapshot in &self.quota_snapshots {
+            snapshot.validate()?;
+            if snapshot.provider_account_id != provider_account_id {
+                return Err(AuthoritativeDataError::MismatchedProviderAccount);
+            }
+        }
+        if let Some(billing) = &self.billing {
+            billing.validate()?;
+        }
+        Ok(())
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.quota_snapshots.is_empty() && self.billing.is_none()
+    }
+}
+
 fn non_empty_identifiers(identifiers: &[&str]) -> Result<(), AuthoritativeDataError> {
     identifiers
         .iter()
@@ -239,6 +306,8 @@ pub enum AuthoritativeDataError {
     InvalidFreshness,
     #[error("a provider-reported charge must use an explicit currency unit")]
     ChargeMustUseCurrency,
+    #[error("provider-authoritative evidence belongs to a different provider account")]
+    MismatchedProviderAccount,
 }
 
 /// A normalized reference to an environment variable that holds a credential.

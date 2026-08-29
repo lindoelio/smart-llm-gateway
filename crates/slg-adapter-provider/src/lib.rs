@@ -2,8 +2,12 @@
 
 use async_trait::async_trait;
 use reqwest::StatusCode;
-use slg_domain::{ErrorCategory, InferenceRequest, ProviderFailure, RouteCandidate};
-use slg_ports::InferenceExecutor;
+use slg_domain::{
+    AuthoritativeSource, ErrorCategory, FixedDecimal, InferenceRequest,
+    ProviderAuthoritativeEvidence, ProviderBillingEvidence, ProviderFailure,
+    ProviderReportedQuantity, ProviderUnit, ProviderUnitKind, RouteCandidate,
+};
+use slg_ports::{InferenceExecution, InferenceExecutor};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
@@ -33,7 +37,7 @@ impl InferenceExecutor for OpenAiCompatibleExecutor {
         route: &RouteCandidate,
         request: &InferenceRequest,
         credential: &str,
-    ) -> Result<serde_json::Value, ProviderFailure> {
+    ) -> Result<InferenceExecution, ProviderFailure> {
         if request.stream {
             return Err(ProviderFailure {
                 category: ErrorCategory::Unknown,
@@ -66,10 +70,81 @@ impl InferenceExecutor for OpenAiCompatibleExecutor {
         let status = response.status();
         let body = response.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({"error": {"message": "provider returned an invalid JSON response"}}));
         if status.is_success() {
-            return Ok(body);
+            return Ok(InferenceExecution {
+                authoritative_evidence: openai_usage_evidence(&body),
+                response: body,
+            });
         }
         Err(classify(status, &body))
     }
+}
+
+/// Extracts only explicit OpenAI-compatible `usage` quantities. It does not
+/// infer price, remaining quota, balance, or capacity from token counts.
+fn openai_usage_evidence(body: &serde_json::Value) -> Option<ProviderAuthoritativeEvidence> {
+    let usage = body.get("usage")?;
+    let mut billed_units = Vec::new();
+    add_usage_quantity(
+        &mut billed_units,
+        usage.get("prompt_tokens"),
+        ProviderUnitKind::InputTokens,
+    );
+    add_usage_quantity(
+        &mut billed_units,
+        usage.pointer("/prompt_tokens_details/cached_tokens"),
+        ProviderUnitKind::CachedInputTokens,
+    );
+    add_usage_quantity(
+        &mut billed_units,
+        usage.get("completion_tokens"),
+        ProviderUnitKind::OutputTokens,
+    );
+    add_usage_quantity(
+        &mut billed_units,
+        usage.pointer("/completion_tokens_details/reasoning_tokens"),
+        ProviderUnitKind::ReasoningTokens,
+    );
+    add_usage_quantity(
+        &mut billed_units,
+        usage.get("total_tokens"),
+        ProviderUnitKind::TotalTokens,
+    );
+    (!billed_units.is_empty()).then_some(ProviderAuthoritativeEvidence {
+        quota_snapshots: Vec::new(),
+        billing: Some(ProviderBillingEvidence {
+            // OpenAI-compatible completion ids are not universally request
+            // ids, so retain no correlation identifier unless a dedicated
+            // provider capability supplies one.
+            provider_request_id: None,
+            billed_units,
+            charge: None,
+            source: AuthoritativeSource {
+                source_id: "openai-compatible.chat-completions.usage".into(),
+                evidence_version: None,
+            },
+        }),
+    })
+}
+
+fn add_usage_quantity(
+    billed_units: &mut Vec<ProviderReportedQuantity>,
+    value: Option<&serde_json::Value>,
+    kind: ProviderUnitKind,
+) {
+    let Some(unscaled) = value
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| i64::try_from(value).ok())
+    else {
+        return;
+    };
+    billed_units.push(ProviderReportedQuantity {
+        unit: ProviderUnit {
+            kind,
+            currency_code: None,
+            custom_name: None,
+        },
+        value: FixedDecimal { unscaled, scale: 0 },
+    });
 }
 
 fn classify(status: StatusCode, body: &serde_json::Value) -> ProviderFailure {
@@ -159,5 +234,51 @@ mod tests {
         assert_eq!(failure.category, ErrorCategory::ProviderUnavailable);
         assert_eq!(failure.message, "provider request could not be completed");
         assert!(!failure.message.contains(raw_message));
+    }
+
+    #[test]
+    fn extracts_only_explicit_usage_without_estimated_accounting() {
+        let evidence = openai_usage_evidence(&serde_json::json!({
+            "usage": {
+                "prompt_tokens": 12,
+                "prompt_tokens_details": {"cached_tokens": 3},
+                "completion_tokens": 7,
+                "completion_tokens_details": {"reasoning_tokens": 2},
+                "total_tokens": 19
+            }
+        }))
+        .unwrap();
+        let billing = evidence.billing.unwrap();
+        assert_eq!(evidence.quota_snapshots, Vec::new());
+        assert_eq!(billing.charge, None);
+        assert_eq!(
+            billing
+                .billed_units
+                .iter()
+                .map(|quantity| quantity.unit.kind)
+                .collect::<Vec<_>>(),
+            [
+                ProviderUnitKind::InputTokens,
+                ProviderUnitKind::CachedInputTokens,
+                ProviderUnitKind::OutputTokens,
+                ProviderUnitKind::ReasoningTokens,
+                ProviderUnitKind::TotalTokens,
+            ]
+        );
+        assert_eq!(
+            billing.source.source_id,
+            "openai-compatible.chat-completions.usage"
+        );
+    }
+
+    #[test]
+    fn does_not_invent_evidence_when_usage_is_absent_or_invalid() {
+        assert!(openai_usage_evidence(&serde_json::json!({"id": "completion"})).is_none());
+        assert!(
+            openai_usage_evidence(&serde_json::json!({
+                "usage": {"total_tokens": "not-a-number"}
+            }))
+            .is_none()
+        );
     }
 }

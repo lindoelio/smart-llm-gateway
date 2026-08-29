@@ -2,8 +2,8 @@
 
 use async_trait::async_trait;
 use slg_domain::{
-    AttemptId, CredentialReference, InferenceRequest, ProviderBillingRecord, ProviderFailure,
-    ProviderQuotaSnapshot, RouteCandidate,
+    AttemptId, CredentialReference, InferenceRequest, ProviderAuthoritativeEvidence,
+    ProviderBillingRecord, ProviderFailure, ProviderQuotaSnapshot, RouteCandidate,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -85,6 +85,28 @@ pub trait SecretResolver: Send + Sync {
     async fn resolve(&self, reference: &CredentialReference) -> Result<String, String>;
 }
 
+/// A provider execution result preserving the exact client response plus any
+/// optional facts explicitly supplied by that provider.
+///
+/// Evidence is deliberately separate from `response`: inbound adapters return
+/// only `response` to the client, while the application may persist validated
+/// authoritative facts for operator inspection.
+#[derive(Debug, Clone)]
+pub struct InferenceExecution {
+    pub response: serde_json::Value,
+    pub authoritative_evidence: Option<ProviderAuthoritativeEvidence>,
+}
+
+impl InferenceExecution {
+    #[must_use]
+    pub const fn without_evidence(response: serde_json::Value) -> Self {
+        Self {
+            response,
+            authoritative_evidence: None,
+        }
+    }
+}
+
 #[async_trait]
 pub trait InferenceExecutor: Send + Sync {
     async fn execute(
@@ -92,5 +114,5 @@ pub trait InferenceExecutor: Send + Sync {
         route: &RouteCandidate,
         request: &InferenceRequest,
         credential: &str,
-    ) -> Result<serde_json::Value, ProviderFailure>;
+    ) -> Result<InferenceExecution, ProviderFailure>;
 }
