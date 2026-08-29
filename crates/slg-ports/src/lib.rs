@@ -2,7 +2,8 @@
 
 use async_trait::async_trait;
 use slg_domain::{
-    AttemptId, CredentialReference, InferenceRequest, ProviderFailure, RouteCandidate,
+    AttemptId, CredentialReference, InferenceRequest, ProviderBillingRecord, ProviderFailure,
+    ProviderQuotaSnapshot, RouteCandidate,
 };
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -44,6 +45,37 @@ pub trait ConfigurationRepository: Send + Sync {
         account_id: &str,
         failure: &ProviderFailure,
     ) -> Result<(), String>;
+}
+
+/// Persistence and inspection boundary for provider-authoritative accounting.
+///
+/// Implementations store only facts supplied by a provider capability. This
+/// port deliberately offers no method for estimating quota, price, balance, or
+/// eligibility; routing policy belongs to the application layer.
+#[async_trait]
+pub trait AuthoritativeAccountingRepository: Send + Sync {
+    /// Appends one immutable quota/plan/balance/usage observation.
+    ///
+    /// Repeated delivery of the same `snapshot_id` is idempotent.
+    async fn record_quota_snapshot(&self, snapshot: ProviderQuotaSnapshot) -> Result<(), String>;
+
+    /// Appends one immutable provider-reported billing record.
+    ///
+    /// Repeated delivery of the same `record_id` is idempotent. Individual
+    /// billable units and currency remain provider-reported facts.
+    async fn record_billing_record(&self, record: ProviderBillingRecord) -> Result<(), String>;
+
+    /// Returns authoritative quota evidence for safe operator inspection.
+    async fn quota_snapshots(
+        &self,
+        provider_account_id: &str,
+    ) -> Result<Vec<ProviderQuotaSnapshot>, String>;
+
+    /// Returns provider-reported billing evidence for one gateway attempt.
+    async fn billing_records(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<Vec<ProviderBillingRecord>, String>;
 }
 
 #[async_trait]

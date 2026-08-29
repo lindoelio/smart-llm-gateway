@@ -8,6 +8,8 @@ use slg_adapter_secrets::EnvironmentSecretResolver;
 use slg_adapter_storage_postgres::PostgresStore;
 use slg_adapter_storage_sqlite::SqliteStore;
 use slg_application::Gateway;
+use slg_domain::{AttemptId, FixedDecimal, ProviderBillingRecord, ProviderQuotaSnapshot};
+use slg_ports::AuthoritativeAccountingRepository;
 
 #[derive(Debug, Parser)]
 #[command(name = "gateway", version, about = "Smart LLM Gateway")]
@@ -29,6 +31,8 @@ enum Command {
     Route(RouteCommand),
     #[command(subcommand)]
     Fallback(FallbackCommand),
+    #[command(subcommand)]
+    Accounting(AccountingCommand),
     Serve(ServeArgs),
 }
 
@@ -107,6 +111,26 @@ enum FallbackCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum AccountingCommand {
+    /// Inspect provider-authoritative quota observations without estimating availability.
+    Quota {
+        #[command(flatten)]
+        database: DatabaseArgs,
+        #[arg(long)]
+        provider_account: String,
+    },
+    /// Inspect provider-authoritative billing evidence for one gateway attempt.
+    Billing {
+        #[command(flatten)]
+        database: DatabaseArgs,
+        #[arg(long)]
+        provider_account: String,
+        #[arg(long)]
+        attempt: String,
+    },
+}
+
 #[tokio::main]
 async fn main() {
     if let Err(error) = run(Cli::parse()).await {
@@ -180,9 +204,157 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await?;
             print_json(serde_json::json!({"ok": true, "source": source, "target": target}));
         }
+        Command::Accounting(AccountingCommand::Quota {
+            database,
+            provider_account,
+        }) => inspect_quota(&database.database, &provider_account).await?,
+        Command::Accounting(AccountingCommand::Billing {
+            database,
+            provider_account,
+            attempt,
+        }) => inspect_billing(&database.database, &provider_account, &attempt).await?,
         Command::Serve(arguments) => serve(arguments).await?,
     }
     Ok(())
+}
+
+async fn inspect_quota(database: &str, provider_account: &str) -> Result<(), String> {
+    let evaluated_at_unix = unix_timestamp()?;
+    let snapshots = open_store(database)
+        .await?
+        .quota_snapshots(provider_account)
+        .await?;
+    print_json(serde_json::json!({
+        "provider_account_id": provider_account,
+        "evidence_status": accounting_status(snapshots.iter().map(|snapshot| snapshot.fresh_until_unix), evaluated_at_unix),
+        "evaluated_at_unix": evaluated_at_unix,
+        "status_semantics": status_semantics(),
+        "snapshots": snapshots.iter().map(|snapshot| quota_snapshot_json(snapshot, evaluated_at_unix)).collect::<Vec<_>>(),
+    }));
+    Ok(())
+}
+
+async fn inspect_billing(
+    database: &str,
+    provider_account: &str,
+    attempt: &str,
+) -> Result<(), String> {
+    let attempt_id = AttemptId::parse(attempt)
+        .map_err(|_| "attempt must be a valid gateway attempt UUID".to_owned())?;
+    let evaluated_at_unix = unix_timestamp()?;
+    let records = open_store(database)
+        .await?
+        .billing_records(&attempt_id)
+        .await?
+        .into_iter()
+        .filter(|record| record.provider_account_id == provider_account)
+        .collect::<Vec<_>>();
+    print_json(serde_json::json!({
+        "provider_account_id": provider_account,
+        "evidence_status": accounting_status(records.iter().map(|record| record.fresh_until_unix), evaluated_at_unix),
+        "evaluated_at_unix": evaluated_at_unix,
+        "status_semantics": status_semantics(),
+        "records": records.iter().map(|record| billing_record_json(record, evaluated_at_unix)).collect::<Vec<_>>(),
+    }));
+    Ok(())
+}
+
+fn unix_timestamp() -> Result<i64, String> {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|_| "system clock is before the Unix epoch".to_owned())
+        .map(|duration| i64::try_from(duration.as_secs()).unwrap_or(i64::MAX))
+}
+
+fn accounting_status(
+    fresh_until_timestamps: impl Iterator<Item = i64>,
+    evaluated_at_unix: i64,
+) -> &'static str {
+    let mut any_evidence = false;
+    for fresh_until_unix in fresh_until_timestamps {
+        any_evidence = true;
+        if fresh_until_unix >= evaluated_at_unix {
+            return "current";
+        }
+    }
+    if any_evidence { "expired" } else { "absent" }
+}
+
+fn status_semantics() -> serde_json::Value {
+    serde_json::json!({
+        "absent": "no persisted provider-authoritative evidence matched this query",
+        "expired": "persisted evidence exists, but every fresh_until_unix timestamp precedes evaluated_at_unix",
+        "current": "at least one persisted fresh_until_unix timestamp is at or after evaluated_at_unix",
+    })
+}
+
+fn quota_snapshot_json(
+    snapshot: &ProviderQuotaSnapshot,
+    evaluated_at_unix: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "constraint_id": snapshot.constraint_id,
+        "evidence_status": evidence_status(snapshot.fresh_until_unix, evaluated_at_unix),
+        "unit": unit_json(&snapshot.unit),
+        "allowance": decimal_json(snapshot.allowance),
+        "consumed": decimal_json(snapshot.consumed),
+        "remaining": decimal_json(snapshot.remaining),
+        "reset_at_unix": snapshot.reset_at_unix,
+        "observed_at_unix": snapshot.observed_at_unix,
+        "fresh_until_unix": snapshot.fresh_until_unix,
+        "source": source_json(&snapshot.source),
+    })
+}
+
+fn billing_record_json(
+    record: &ProviderBillingRecord,
+    evaluated_at_unix: i64,
+) -> serde_json::Value {
+    serde_json::json!({
+        "evidence_status": evidence_status(record.fresh_until_unix, evaluated_at_unix),
+        "billed_units": record.billed_units.iter().map(quantity_json).collect::<Vec<_>>(),
+        "charge": record.charge.as_ref().map(quantity_json),
+        "observed_at_unix": record.observed_at_unix,
+        "fresh_until_unix": record.fresh_until_unix,
+        "source": source_json(&record.source),
+    })
+}
+
+fn evidence_status(fresh_until_unix: i64, evaluated_at_unix: i64) -> &'static str {
+    if fresh_until_unix >= evaluated_at_unix {
+        "current"
+    } else {
+        "expired"
+    }
+}
+
+fn unit_json(unit: &slg_domain::ProviderUnit) -> serde_json::Value {
+    serde_json::json!({
+        "kind": unit.kind,
+        "currency_code": unit.currency_code,
+        "custom_name": unit.custom_name,
+    })
+}
+
+fn decimal_json(value: Option<FixedDecimal>) -> serde_json::Value {
+    value.map_or(
+        serde_json::Value::Null,
+        |value| serde_json::json!({"unscaled": value.unscaled, "scale": value.scale}),
+    )
+}
+
+fn quantity_json(quantity: &slg_domain::ProviderReportedQuantity) -> serde_json::Value {
+    serde_json::json!({
+        "unit": unit_json(&quantity.unit),
+        "value": decimal_json(Some(quantity.value)),
+    })
+}
+
+fn source_json(source: &slg_domain::AuthoritativeSource) -> serde_json::Value {
+    serde_json::json!({
+        "source_id": source.source_id,
+        "evidence_version": source.evidence_version,
+    })
 }
 
 async fn serve(arguments: ServeArgs) -> Result<(), String> {
@@ -365,6 +537,24 @@ impl Store {
             Self::Postgres(store) => store.add_fallback(source, target, priority).await,
         }
     }
+    async fn quota_snapshots(
+        &self,
+        provider_account_id: &str,
+    ) -> Result<Vec<ProviderQuotaSnapshot>, String> {
+        match self {
+            Self::Sqlite(store) => store.quota_snapshots(provider_account_id).await,
+            Self::Postgres(store) => store.quota_snapshots(provider_account_id).await,
+        }
+    }
+    async fn billing_records(
+        &self,
+        attempt_id: &AttemptId,
+    ) -> Result<Vec<ProviderBillingRecord>, String> {
+        match self {
+            Self::Sqlite(store) => store.billing_records(attempt_id).await,
+            Self::Postgres(store) => store.billing_records(attempt_id).await,
+        }
+    }
 }
 
 async fn open_store(database: &str) -> Result<Store, String> {
@@ -403,7 +593,7 @@ fn print_json(value: serde_json::Value) {
 
 #[cfg(test)]
 mod tests {
-    use super::validate_environment_reference;
+    use super::{accounting_status, validate_environment_reference};
 
     #[test]
     fn accepts_only_explicit_environment_references() {
@@ -416,5 +606,12 @@ mod tests {
         assert!(validate_environment_reference("env:").is_err());
         assert!(validate_environment_reference("env:1INVALID").is_err());
         assert!(validate_environment_reference("env:INVALID-NAME").is_err());
+    }
+
+    #[test]
+    fn accounting_evidence_status_comes_only_from_persisted_freshness() {
+        assert_eq!(accounting_status(std::iter::empty(), 100), "absent");
+        assert_eq!(accounting_status([99, 42].into_iter(), 100), "expired");
+        assert_eq!(accounting_status([99, 100].into_iter(), 100), "current");
     }
 }

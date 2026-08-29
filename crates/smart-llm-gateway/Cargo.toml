@@ -18,6 +18,8 @@ slg-adapter-secrets = { path = "../slg-adapter-secrets" }
 slg-adapter-storage-postgres = { path = "../slg-adapter-storage-postgres" }
 slg-adapter-storage-sqlite = { path = "../slg-adapter-storage-sqlite" }
 slg-application = { path = "../slg-application" }
+slg-domain = { path = "../slg-domain" }
+slg-ports = { path = "../slg-ports" }
 slg-runtime = { path = "../slg-runtime" }
 tokio.workspace = true
 
