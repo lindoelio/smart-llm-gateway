@@ -1,6 +1,10 @@
 //! Ports for persistence, credentials, and one outbound inference attempt.
 
+use std::pin::Pin;
+
 use async_trait::async_trait;
+use bytes::Bytes;
+use futures_util::Stream;
 use slg_domain::{
     AttemptId, CredentialReference, InferenceRequest, ProviderAuthoritativeEvidence,
     ProviderBillingRecord, ProviderFailure, ProviderQuotaSnapshot, RouteCandidate,
@@ -91,19 +95,41 @@ pub trait SecretResolver: Send + Sync {
 /// Evidence is deliberately separate from `response`: inbound adapters return
 /// only `response` to the client, while the application may persist validated
 /// authoritative facts for operator inspection.
-#[derive(Debug, Clone)]
-pub struct InferenceExecution {
-    pub response: serde_json::Value,
-    pub authoritative_evidence: Option<ProviderAuthoritativeEvidence>,
+pub type InferenceStream =
+    Pin<Box<dyn Stream<Item = Result<Bytes, InferenceStreamError>> + Send + 'static>>;
+
+/// A sanitized terminal failure after an upstream streaming response committed.
+///
+/// The selected route owns the response after commitment. Consumers terminate
+/// that response on this error and must never replay the request on another
+/// route.
+#[derive(Debug, thiserror::Error)]
+#[error("committed upstream stream ended unexpectedly")]
+pub struct InferenceStreamError;
+
+/// One outbound attempt, separated by its response commitment semantics.
+pub enum InferenceExecution {
+    Complete {
+        response: serde_json::Value,
+        authoritative_evidence: Option<Box<ProviderAuthoritativeEvidence>>,
+    },
+    /// Successful upstream headers have committed this attempt. Errors yielded
+    /// by `body` are post-commit and therefore never eligible for fallback.
+    Streaming { body: InferenceStream },
 }
 
 impl InferenceExecution {
     #[must_use]
     pub const fn without_evidence(response: serde_json::Value) -> Self {
-        Self {
+        Self::Complete {
             response,
             authoritative_evidence: None,
         }
+    }
+
+    #[must_use]
+    pub fn streaming(body: InferenceStream) -> Self {
+        Self::Streaming { body }
     }
 }
 

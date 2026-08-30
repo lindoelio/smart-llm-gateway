@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::State,
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
@@ -11,7 +12,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use slg_application::{ApplicationError, Gateway};
+use slg_application::{ApplicationError, Gateway, InferenceResponse};
 use slg_domain::{ChatMessage, InferenceRequest};
 use slg_ports::{ConfigurationRepository, InferenceExecutor, SecretResolver};
 use uuid::Uuid;
@@ -69,9 +70,18 @@ where
     application_error_response(gateway.infer(key, request).await)
 }
 
-fn application_error_response(result: Result<serde_json::Value, ApplicationError>) -> Response {
+fn application_error_response(result: Result<InferenceResponse, ApplicationError>) -> Response {
     match result {
-        Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+        Ok(InferenceResponse::Complete(response)) => {
+            (StatusCode::OK, Json(response)).into_response()
+        }
+        Ok(InferenceResponse::Streaming(body)) => Response::builder()
+            .status(StatusCode::OK)
+            .header("content-type", "text/event-stream")
+            .header("cache-control", "no-cache")
+            .header("x-accel-buffering", "no")
+            .body(Body::from_stream(body))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
         Err(ApplicationError::Unauthorized) => error(
             StatusCode::UNAUTHORIZED,
             "invalid_api_key",
@@ -80,11 +90,6 @@ fn application_error_response(result: Result<serde_json::Value, ApplicationError
         Err(ApplicationError::Configuration(message)) => {
             error(StatusCode::BAD_REQUEST, "configuration_error", &message)
         }
-        Err(ApplicationError::StreamingUnsupported) => error(
-            StatusCode::BAD_REQUEST,
-            "unsupported_feature",
-            "Streaming is not supported by this gateway version",
-        ),
         Err(ApplicationError::UpstreamUnavailable) => error(
             StatusCode::SERVICE_UNAVAILABLE,
             "upstream_unavailable",
@@ -121,7 +126,10 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
-    use slg_application::ApplicationError;
+    use bytes::Bytes;
+    use futures_util::stream;
+    use slg_application::{ApplicationError, InferenceResponse};
+    use slg_ports::InferenceExecution;
 
     use super::{application_error_response, sanitized_upstream_message};
 
@@ -143,8 +151,16 @@ mod tests {
     }
 
     #[test]
-    fn streaming_rejection_is_not_a_configuration_error() {
-        let response = application_error_response(Err(ApplicationError::StreamingUnsupported));
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    fn streaming_response_uses_unbuffered_sse_headers() {
+        let InferenceExecution::Streaming { body } = InferenceExecution::streaming(Box::pin(
+            stream::iter([Ok(Bytes::from_static(b"data: [DONE]\n\n"))]),
+        )) else {
+            unreachable!();
+        };
+        let response = application_error_response(Ok(InferenceResponse::Streaming(body)));
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers()["content-type"], "text/event-stream");
+        assert_eq!(response.headers()["cache-control"], "no-cache");
+        assert_eq!(response.headers()["x-accel-buffering"], "no");
     }
 }

@@ -21,8 +21,9 @@ without requiring client-side configuration changes.
 - SQLite for a self-contained local installation and PostgreSQL for shared
   deployments.
 - Failure classification, circuit-state persistence, and attempt recording.
-- Non-streaming requests for the current public slice. Streaming requests are
-  rejected explicitly rather than silently changing behavior.
+- Streaming and non-streaming chat completions. Streaming responses are
+  forwarded as SSE without buffering the full completion, and fallback stops
+  once an upstream streaming response commits.
 
 The project is intentionally provider-neutral: PostgreSQL hosting choices,
 including managed hosts, are deployment decisions rather than product
@@ -89,8 +90,8 @@ project.
 
 ### Status and roadmap
 
-The initial non-streaming OpenAI-compatible slice is implemented. Streaming,
-additional inbound protocols, provider-native quota synchronization, billing
+The initial OpenAI-compatible slice, including streaming, is implemented.
+Additional inbound protocols, provider-native quota synchronization, billing
 reconciliation, and distribution automation remain roadmap work.
 
 ### License
@@ -117,8 +118,9 @@ sem alterar a configuração dos clientes.
   compartilhadas.
 - Classificação de falhas, persistência do estado de circuitos e registro de
   tentativas.
-- Requisições sem streaming nesta fatia pública. Requisições com streaming são
-  rejeitadas explicitamente; o comportamento nunca é alterado silenciosamente.
+- Chat completions com e sem streaming. Respostas em streaming são encaminhadas
+  como SSE sem armazenar a conclusão inteira em memória, e o fallback termina
+  quando a resposta em streaming do upstream é comprometida.
 
 O projeto é neutro em relação a provedores: a escolha de hospedagem PostgreSQL,
 inclusive serviços gerenciados, é uma decisão de implantação e não uma
@@ -185,10 +187,9 @@ projeto.
 
 ### Status e roadmap
 
-A fatia inicial não streaming compatível com OpenAI está implementada.
-Streaming, protocolos de entrada adicionais, sincronização de cotas nativas dos
-provedores, reconciliação de cobrança e automação de distribuição continuam no
-roadmap.
+A fatia inicial compatível com OpenAI, incluindo streaming, está implementada.
+Protocolos de entrada adicionais, sincronização de cotas nativas dos provedores,
+reconciliação de cobrança e automação de distribuição continuam no roadmap.
 
 ### Licença
 

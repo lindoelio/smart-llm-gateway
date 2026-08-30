@@ -7,8 +7,8 @@ use slg_domain::{
     AttemptId, InferenceRequest, ProviderAuthoritativeEvidence, ProviderBillingRecord,
 };
 use slg_ports::{
-    AttemptRecord, AuthoritativeAccountingRepository, ConfigurationRepository, InferenceExecutor,
-    SecretResolver, UsageSpool,
+    AttemptRecord, AuthoritativeAccountingRepository, ConfigurationRepository, InferenceExecution,
+    InferenceExecutor, InferenceStream, SecretResolver, UsageSpool,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -17,12 +17,17 @@ pub enum ApplicationError {
     Unauthorized,
     #[error("configuration error: {0}")]
     Configuration(String),
-    #[error("streaming is not supported by this gateway version")]
-    StreamingUnsupported,
     #[error("no upstream route is currently available")]
     UpstreamUnavailable,
     #[error("no eligible route succeeded: {0}")]
     Upstream(String),
+}
+
+/// A protocol-neutral application response. Streaming bodies are already
+/// committed to one upstream route and must be forwarded without replay.
+pub enum InferenceResponse {
+    Complete(serde_json::Value),
+    Streaming(InferenceStream),
 }
 
 pub struct Gateway<C, E, S> {
@@ -147,10 +152,7 @@ where
         &self,
         raw_key: &str,
         request: InferenceRequest,
-    ) -> Result<serde_json::Value, ApplicationError> {
-        if request.stream {
-            return Err(ApplicationError::StreamingUnsupported);
-        }
+    ) -> Result<InferenceResponse, ApplicationError> {
         if !self
             .configuration
             .authenticate(raw_key)
@@ -182,27 +184,41 @@ where
             match self.executor.execute(&route, &request, &credential).await {
                 Ok(execution) => {
                     let attempt_id = AttemptId::new();
+                    let outcome = match execution {
+                        InferenceExecution::Complete { .. } => "succeeded",
+                        InferenceExecution::Streaming { .. } => "committed",
+                    };
                     self.persist_attempt(AttemptRecord {
                         attempt_id: attempt_id.clone(),
                         request_id: request.request_id.to_string(),
                         route_id: route.route_id.clone(),
-                        outcome: "succeeded".into(),
+                        outcome: outcome.into(),
                         failure_category: None,
                     })
                     .await?;
-                    if let Some(evidence) = execution.authoritative_evidence {
-                        self.persist_authoritative_evidence(
-                            &route.provider_account_id,
-                            &attempt_id,
-                            evidence,
-                        )
-                        .await;
-                    }
                     self.configuration
                         .mark_route_success(&route.route_id)
                         .await
                         .map_err(ApplicationError::Configuration)?;
-                    return Ok(execution.response);
+                    return match execution {
+                        InferenceExecution::Complete {
+                            response,
+                            authoritative_evidence,
+                        } => {
+                            if let Some(evidence) = authoritative_evidence {
+                                self.persist_authoritative_evidence(
+                                    &route.provider_account_id,
+                                    &attempt_id,
+                                    *evidence,
+                                )
+                                .await;
+                            }
+                            Ok(InferenceResponse::Complete(response))
+                        }
+                        InferenceExecution::Streaming { body } => {
+                            Ok(InferenceResponse::Streaming(body))
+                        }
+                    };
                 }
                 Err(failure) => {
                     let category = format!("{:?}", failure.category);
@@ -249,6 +265,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
+    use bytes::Bytes;
+    use futures_util::{StreamExt, stream};
     use slg_domain::{
         AuthoritativeSource, CredentialReference, ErrorCategory, FixedDecimal,
         ProviderAuthoritativeEvidence, ProviderBillingEvidence, ProviderFailure,
@@ -313,7 +331,7 @@ mod tests {
         async fn execute(
             &self,
             route: &RouteCandidate,
-            _: &InferenceRequest,
+            request: &InferenceRequest,
             _: &str,
         ) -> Result<InferenceExecution, ProviderFailure> {
             if route.route_id == "failing-route" {
@@ -323,6 +341,14 @@ mod tests {
                     status: Some(503),
                     retry_at_unix: None,
                 });
+            }
+            if request.stream {
+                return Ok(InferenceExecution::streaming(Box::pin(stream::iter([
+                    Ok(Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                    )),
+                    Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                ]))));
             }
             Ok(InferenceExecution::without_evidence(
                 serde_json::json!({"id": "response"}),
@@ -341,6 +367,34 @@ mod tests {
             _: &str,
         ) -> Result<InferenceExecution, ProviderFailure> {
             panic!("streaming requests must not reach the executor")
+        }
+    }
+
+    #[derive(Clone, Default)]
+    struct CommittedStreamExecutor {
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl InferenceExecutor for CommittedStreamExecutor {
+        async fn execute(
+            &self,
+            route: &RouteCandidate,
+            _: &InferenceRequest,
+            _: &str,
+        ) -> Result<InferenceExecution, ProviderFailure> {
+            self.calls.lock().unwrap().push(route.route_id.clone());
+            if route.route_id == "committed-route" {
+                return Ok(InferenceExecution::streaming(Box::pin(stream::iter([
+                    Ok(Bytes::from_static(
+                        b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
+                    )),
+                    Err(slg_ports::InferenceStreamError),
+                ]))));
+            }
+            Ok(InferenceExecution::streaming(Box::pin(stream::iter([Ok(
+                Bytes::from_static(b"data: fallback-must-not-run\n\n"),
+            )]))))
         }
     }
 
@@ -444,9 +498,9 @@ mod tests {
             _: &InferenceRequest,
             _: &str,
         ) -> Result<InferenceExecution, ProviderFailure> {
-            Ok(InferenceExecution {
+            Ok(InferenceExecution::Complete {
                 response: serde_json::json!({"id": "response", "usage": {"total_tokens": 8}}),
-                authoritative_evidence: Some(ProviderAuthoritativeEvidence {
+                authoritative_evidence: Some(Box::new(ProviderAuthoritativeEvidence {
                     quota_snapshots: Vec::new(),
                     billing: Some(ProviderBillingEvidence {
                         provider_request_id: None,
@@ -467,7 +521,7 @@ mod tests {
                             evidence_version: Some("test-v1".into()),
                         },
                     }),
-                }),
+                })),
             })
         }
     }
@@ -499,6 +553,13 @@ mod tests {
         }
     }
 
+    fn complete_response(response: InferenceResponse) -> serde_json::Value {
+        match response {
+            InferenceResponse::Complete(value) => value,
+            InferenceResponse::Streaming(_) => panic!("expected a complete response"),
+        }
+    }
+
     #[tokio::test]
     async fn spools_usage_when_primary_persistence_fails_without_sensitive_request_data() {
         let spool = RecordingSpool::default();
@@ -514,7 +575,7 @@ mod tests {
         .with_usage_spool(spool.clone());
 
         assert_eq!(
-            gateway.infer("gateway-key", request()).await.unwrap(),
+            complete_response(gateway.infer("gateway-key", request()).await.unwrap()),
             serde_json::json!({"id": "response"})
         );
 
@@ -550,6 +611,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_failure_before_commit_falls_back_to_next_route() {
+        let spool = RecordingSpool::default();
+        let gateway = Gateway::new(
+            TestConfiguration {
+                candidates: vec![route("failing-route"), route("working-route")],
+                primary_usage_available: false,
+                route_state_available: true,
+            },
+            TestExecutor,
+            TestSecrets,
+        )
+        .with_usage_spool(spool.clone());
+        let mut streaming_request = request();
+        streaming_request.stream = true;
+
+        let InferenceResponse::Streaming(body) = gateway
+            .infer("gateway-key", streaming_request)
+            .await
+            .unwrap()
+        else {
+            panic!("expected fallback route to return a stream");
+        };
+        let chunks = body.collect::<Vec<_>>().await;
+        assert_eq!(chunks.len(), 2);
+        assert!(chunks.iter().all(Result::is_ok));
+        let attempts = spool.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, "failed");
+        assert_eq!(attempts[1].outcome, "committed");
+    }
+
+    #[tokio::test]
     async fn control_plane_failure_remains_visible_after_usage_is_spooled() {
         let spool = RecordingSpool::default();
         let gateway = Gateway::new(
@@ -581,15 +674,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streaming_is_rejected_before_executor_or_control_plane_access() {
+    async fn unavailable_streaming_route_is_reported_before_executor_access() {
         let gateway = Gateway::new(UnavailableConfiguration, PanicExecutor, TestSecrets);
         let mut streaming_request = request();
         streaming_request.stream = true;
 
         assert!(matches!(
             gateway.infer("gateway-key", streaming_request).await,
-            Err(ApplicationError::StreamingUnsupported)
+            Err(ApplicationError::UpstreamUnavailable)
         ));
+    }
+
+    #[tokio::test]
+    async fn post_commit_stream_failure_never_falls_back() {
+        let spool = RecordingSpool::default();
+        let executor = CommittedStreamExecutor::default();
+        let gateway = Gateway::new(
+            TestConfiguration {
+                candidates: vec![route("committed-route"), route("fallback-route")],
+                primary_usage_available: false,
+                route_state_available: true,
+            },
+            executor.clone(),
+            TestSecrets,
+        )
+        .with_usage_spool(spool.clone());
+        let mut streaming_request = request();
+        streaming_request.stream = true;
+
+        let InferenceResponse::Streaming(mut body) = gateway
+            .infer("gateway-key", streaming_request)
+            .await
+            .unwrap()
+        else {
+            panic!("expected a streaming response");
+        };
+        assert!(body.next().await.unwrap().is_ok());
+        assert!(body.next().await.unwrap().is_err());
+        assert_eq!(
+            executor.calls.lock().unwrap().as_slice(),
+            ["committed-route"]
+        );
+        let attempts = spool.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].outcome, "committed");
+        let serialized = serde_json::to_string(&attempts[0]).unwrap();
+        assert!(!serialized.contains("partial"));
+        assert!(!serialized.contains("prompt-that-must-not-be-spooled"));
     }
 
     #[tokio::test]
@@ -607,7 +738,7 @@ mod tests {
         .with_accounting_repository(accounting.clone());
 
         assert_eq!(
-            gateway.infer("gateway-key", request()).await.unwrap(),
+            complete_response(gateway.infer("gateway-key", request()).await.unwrap()),
             serde_json::json!({"id": "response", "usage": {"total_tokens": 8}})
         );
         let billing = accounting.billing.lock().unwrap();
@@ -635,10 +766,12 @@ mod tests {
         )
         .with_accounting_repository(absent.clone());
         assert_eq!(
-            gateway_without_evidence
-                .infer("gateway-key", request())
-                .await
-                .unwrap(),
+            complete_response(
+                gateway_without_evidence
+                    .infer("gateway-key", request())
+                    .await
+                    .unwrap(),
+            ),
             serde_json::json!({"id": "response"})
         );
         assert!(absent.billing.lock().unwrap().is_empty());
@@ -658,10 +791,12 @@ mod tests {
         )
         .with_accounting_repository(unavailable);
         assert_eq!(
-            gateway_with_failed_accounting
-                .infer("gateway-key", request())
-                .await
-                .unwrap(),
+            complete_response(
+                gateway_with_failed_accounting
+                    .infer("gateway-key", request())
+                    .await
+                    .unwrap(),
+            ),
             serde_json::json!({"id": "response", "usage": {"total_tokens": 8}})
         );
     }

@@ -7,9 +7,12 @@ publish = false
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 slg-domain = { path = "../slg-domain" }
+thiserror.workspace = true
 
 [lints]
 workspace = true

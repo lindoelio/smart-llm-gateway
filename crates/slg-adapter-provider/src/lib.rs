@@ -1,13 +1,14 @@
 //! Generic OpenAI-compatible provider connector with conservative error mapping.
 
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use reqwest::StatusCode;
 use slg_domain::{
     AuthoritativeSource, ErrorCategory, FixedDecimal, InferenceRequest,
     ProviderAuthoritativeEvidence, ProviderBillingEvidence, ProviderFailure,
     ProviderReportedQuantity, ProviderUnit, ProviderUnitKind, RouteCandidate,
 };
-use slg_ports::{InferenceExecution, InferenceExecutor};
+use slg_ports::{InferenceExecution, InferenceExecutor, InferenceStreamError};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
@@ -38,15 +39,6 @@ impl InferenceExecutor for OpenAiCompatibleExecutor {
         request: &InferenceRequest,
         credential: &str,
     ) -> Result<InferenceExecution, ProviderFailure> {
-        if request.stream {
-            return Err(ProviderFailure {
-                category: ErrorCategory::Unknown,
-                message: "streaming is not yet enabled for the initial OpenAI-compatible slice"
-                    .into(),
-                status: None,
-                retry_at_unix: None,
-            });
-        }
         let url = format!(
             "{}/v1/chat/completions",
             route.base_url.trim_end_matches('/')
@@ -68,14 +60,26 @@ impl InferenceExecutor for OpenAiCompatibleExecutor {
                 retry_at_unix: None,
             })?;
         let status = response.status();
-        let body = response.json::<serde_json::Value>().await.unwrap_or_else(|_| serde_json::json!({"error": {"message": "provider returned an invalid JSON response"}}));
-        if status.is_success() {
-            return Ok(InferenceExecution {
-                authoritative_evidence: openai_usage_evidence(&body),
-                response: body,
-            });
+        if !status.is_success() {
+            let body = response.json::<serde_json::Value>().await.unwrap_or_else(
+                |_| serde_json::json!({"error": {"code": "invalid_upstream_error"}}),
+            );
+            return Err(classify(status, &body));
         }
-        Err(classify(status, &body))
+        if request.stream {
+            let body = response
+                .bytes_stream()
+                .map(|chunk| chunk.map_err(|_| InferenceStreamError));
+            return Ok(InferenceExecution::streaming(Box::pin(body)));
+        }
+        let body = response
+            .json::<serde_json::Value>()
+            .await
+            .unwrap_or_else(|_| serde_json::json!({"error": {"message": "provider returned an invalid JSON response"}}));
+        Ok(InferenceExecution::Complete {
+            authoritative_evidence: openai_usage_evidence(&body).map(Box::new),
+            response: body,
+        })
     }
 }
 
@@ -211,7 +215,130 @@ const fn client_message(category: ErrorCategory) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::convert::Infallible;
+    use std::sync::Arc;
+
+    use axum::{Router, body::Body, extract::State, response::Response, routing::post};
+    use futures_util::{TryStreamExt, stream};
+    use tokio::sync::Notify;
+
     use super::*;
+
+    fn route(base_url: String) -> RouteCandidate {
+        RouteCandidate {
+            route_id: "route".into(),
+            logical_model: "logical-model".into(),
+            provider_account_id: "account".into(),
+            provider: "test".into(),
+            credential_ref: slg_domain::CredentialReference::parse("env:TEST_KEY").unwrap(),
+            base_url,
+            upstream_model: "upstream-model".into(),
+            priority: 1,
+        }
+    }
+
+    fn streaming_request() -> InferenceRequest {
+        InferenceRequest {
+            request_id: uuid::Uuid::new_v4(),
+            model: "logical-model".into(),
+            messages: vec![slg_domain::ChatMessage {
+                role: "user".into(),
+                content: "sensitive prompt".into(),
+            }],
+            stream: true,
+            temperature: None,
+            max_tokens: None,
+        }
+    }
+
+    async fn gated_sse(State(first_event): State<Arc<Notify>>) -> Response {
+        let chunks = stream::unfold((0_u8, first_event), |(index, first_event)| async move {
+            match index {
+                0 => {
+                    first_event.notified().await;
+                    Some((
+                        Ok::<_, Infallible>(
+                            "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
+                        ),
+                        (1, first_event),
+                    ))
+                }
+                1 => Some((Ok("data: [DONE]\n\n"), (2, first_event))),
+                _ => None,
+            }
+        });
+        Response::builder()
+            .header("content-type", "text/event-stream")
+            .body(Body::from_stream(chunks))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn streaming_success_returns_after_headers_and_proxies_sse_chunks() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let first_event = Arc::new(Notify::new());
+        let server_first_event = first_event.clone();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                Router::new()
+                    .route("/v1/chat/completions", post(gated_sse))
+                    .with_state(server_first_event),
+            )
+            .await
+            .unwrap();
+        });
+
+        let execution = tokio::time::timeout(
+            Duration::from_secs(1),
+            OpenAiCompatibleExecutor::new().execute(
+                &route(format!("http://{address}")),
+                &streaming_request(),
+                "credential-that-must-not-leak",
+            ),
+        )
+        .await
+        .expect("executor buffered the first SSE event")
+        .unwrap();
+        first_event.notify_one();
+        let InferenceExecution::Streaming { body } = execution else {
+            panic!("expected a streaming execution");
+        };
+        let chunks = body.try_collect::<Vec<_>>().await.unwrap();
+        let proxied = chunks
+            .into_iter()
+            .flat_map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            proxied,
+            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn transport_failure_before_headers_is_fallback_eligible_and_sanitized() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+
+        let Err(failure) = OpenAiCompatibleExecutor::new()
+            .execute(
+                &route(format!("http://{address}")),
+                &streaming_request(),
+                "credential-that-must-not-leak",
+            )
+            .await
+        else {
+            panic!("connection failure must remain pre-commit");
+        };
+        assert_eq!(failure.category, ErrorCategory::ProviderUnavailable);
+        assert_eq!(failure.message, "provider request could not be completed");
+        assert!(!failure.message.contains("credential-that-must-not-leak"));
+        assert!(!failure.message.contains("sensitive prompt"));
+    }
+
     #[test]
     fn unknown_429_is_rate_limited_not_quota() {
         assert_eq!(

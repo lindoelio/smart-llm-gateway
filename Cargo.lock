@@ -1361,6 +1361,8 @@ name = "slg-adapter-inbound-openai"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "bytes",
+ "futures-util",
  "serde",
  "serde_json",
  "slg-application",
@@ -1374,11 +1376,15 @@ name = "slg-adapter-provider"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "futures-util",
  "reqwest",
  "serde_json",
  "slg-adapter-upstream-openai",
  "slg-domain",
  "slg-ports",
+ "tokio",
+ "uuid",
 ]
 
 [[package]]
@@ -1432,6 +1438,8 @@ name = "slg-application"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "futures-util",
  "serde_json",
  "slg-domain",
  "slg-ports",
@@ -1455,9 +1463,12 @@ name = "slg-ports"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "futures-util",
  "serde",
  "serde_json",
  "slg-domain",
+ "thiserror",
 ]
 
 [[package]]
