@@ -1368,6 +1368,7 @@ dependencies = [
  "slg-application",
  "slg-domain",
  "slg-ports",
+ "tokio",
  "uuid",
 ]
 
@@ -1429,8 +1430,12 @@ dependencies = [
 name = "slg-adapter-upstream-openai"
 version = "0.1.0"
 dependencies = [
+ "bytes",
+ "futures-util",
  "serde_json",
  "slg-domain",
+ "slg-ports",
+ "tokio",
 ]
 
 [[package]]
@@ -1438,7 +1443,6 @@ name = "slg-application"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
  "futures-util",
  "serde_json",
  "slg-domain",
@@ -1463,12 +1467,10 @@ name = "slg-ports"
 version = "0.1.0"
 dependencies = [
  "async-trait",
- "bytes",
  "futures-util",
  "serde",
  "serde_json",
  "slg-domain",
- "thiserror",
 ]
 
 [[package]]

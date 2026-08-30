@@ -3,7 +3,6 @@
 use std::pin::Pin;
 
 use async_trait::async_trait;
-use bytes::Bytes;
 use futures_util::Stream;
 use slg_domain::{
     AttemptId, CredentialReference, InferenceRequest, ProviderAuthoritativeEvidence,
@@ -16,8 +15,43 @@ pub struct AttemptRecord {
     pub attempt_id: AttemptId,
     pub request_id: String,
     pub route_id: String,
-    pub outcome: String,
+    pub outcome: AttemptOutcome,
     pub failure_category: Option<String>,
+}
+
+/// Monotonic lifecycle for one provider attempt.
+///
+/// `Committed` may transition exactly once to a terminal streaming outcome.
+/// Every other variant is terminal and replaying it is idempotent.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum AttemptOutcome {
+    Failed,
+    Committed,
+    Succeeded,
+    PartialFailed,
+    Cancelled,
+}
+
+impl AttemptOutcome {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Failed => "failed",
+            Self::Committed => "committed",
+            Self::Succeeded => "succeeded",
+            Self::PartialFailed => "partial_failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    #[must_use]
+    pub const fn is_stream_terminal(self) -> bool {
+        matches!(
+            self,
+            Self::Succeeded | Self::PartialFailed | Self::Cancelled
+        )
+    }
 }
 
 /// Durable, local-only fallback for immutable usage-attempt evidence.
@@ -37,6 +71,8 @@ pub trait UsageSpool: Send + Sync {
 pub trait ConfigurationRepository: Send + Sync {
     async fn authenticate(&self, raw_key: &str) -> Result<bool, String>;
     async fn candidates(&self, logical_model: &str) -> Result<Vec<RouteCandidate>, String>;
+    /// Inserts an attempt or applies its one permitted monotonic transition:
+    /// `committed -> succeeded|partial_failed|cancelled`.
     async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), String>;
     async fn mark_route_success(&self, route_id: &str) -> Result<(), String>;
     async fn mark_route_failure(
@@ -95,17 +131,19 @@ pub trait SecretResolver: Send + Sync {
 /// Evidence is deliberately separate from `response`: inbound adapters return
 /// only `response` to the client, while the application may persist validated
 /// authoritative facts for operator inspection.
-pub type InferenceStream =
-    Pin<Box<dyn Stream<Item = Result<Bytes, InferenceStreamError>> + Send + 'static>>;
+pub type InferenceStream = Pin<Box<dyn Stream<Item = InferenceStreamEvent> + Send + 'static>>;
 
-/// A sanitized terminal failure after an upstream streaming response committed.
+/// Typed events crossing the upstream/application boundary.
 ///
-/// The selected route owns the response after commitment. Consumers terminate
-/// that response on this error and must never replay the request on another
-/// route.
-#[derive(Debug, thiserror::Error)]
-#[error("committed upstream stream ended unexpectedly")]
-pub struct InferenceStreamError;
+/// Frames contain a validated complete OpenAI-compatible JSON object. A stream
+/// has exactly one terminal event: `[DONE]` becomes `Completed`; every other
+/// terminal condition becomes `Failed` with sanitized provider evidence.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InferenceStreamEvent {
+    Frame(serde_json::Value),
+    Completed,
+    Failed(ProviderFailure),
+}
 
 /// One outbound attempt, separated by its response commitment semantics.
 pub enum InferenceExecution {

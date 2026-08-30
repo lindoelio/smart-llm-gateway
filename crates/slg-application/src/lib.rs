@@ -1,14 +1,19 @@
 //! Use cases that coordinate the pure router with external ports.
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use slg_domain::{
     AttemptId, InferenceRequest, ProviderAuthoritativeEvidence, ProviderBillingRecord,
+    ProviderFailure,
 };
 use slg_ports::{
-    AttemptRecord, AuthoritativeAccountingRepository, ConfigurationRepository, InferenceExecution,
-    InferenceExecutor, InferenceStream, SecretResolver, UsageSpool,
+    AttemptOutcome, AttemptRecord, AuthoritativeAccountingRepository, ConfigurationRepository,
+    InferenceExecution, InferenceExecutor, InferenceStream, InferenceStreamEvent, SecretResolver,
+    UsageSpool,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -31,20 +36,20 @@ pub enum InferenceResponse {
 }
 
 pub struct Gateway<C, E, S> {
-    configuration: C,
-    executor: E,
-    secrets: S,
+    configuration: Arc<C>,
+    executor: Arc<E>,
+    secrets: Arc<S>,
     usage_spool: Option<Arc<dyn UsageSpool>>,
     accounting: Option<Arc<dyn AuthoritativeAccountingRepository>>,
 }
 
 impl<C, E, S> Gateway<C, E, S> {
     #[must_use]
-    pub const fn new(configuration: C, executor: E, secrets: S) -> Self {
+    pub fn new(configuration: C, executor: E, secrets: S) -> Self {
         Self {
-            configuration,
-            executor,
-            secrets,
+            configuration: Arc::new(configuration),
+            executor: Arc::new(executor),
+            secrets: Arc::new(secrets),
             usage_spool: None,
             accounting: None,
         }
@@ -77,9 +82,197 @@ impl<C, E, S> Gateway<C, E, S> {
     }
 }
 
+struct StreamAttempt<C> {
+    configuration: Arc<C>,
+    usage_spool: Option<Arc<dyn UsageSpool>>,
+    attempt_id: AttemptId,
+    request_id: String,
+    route_id: String,
+    provider_account_id: String,
+}
+
+impl<C> Clone for StreamAttempt<C> {
+    fn clone(&self) -> Self {
+        Self {
+            configuration: self.configuration.clone(),
+            usage_spool: self.usage_spool.clone(),
+            attempt_id: self.attempt_id.clone(),
+            request_id: self.request_id.clone(),
+            route_id: self.route_id.clone(),
+            provider_account_id: self.provider_account_id.clone(),
+        }
+    }
+}
+
+impl<C> StreamAttempt<C>
+where
+    C: ConfigurationRepository + 'static,
+{
+    fn record(&self, outcome: AttemptOutcome, failure_category: Option<String>) -> AttemptRecord {
+        AttemptRecord {
+            attempt_id: self.attempt_id.clone(),
+            request_id: self.request_id.clone(),
+            route_id: self.route_id.clone(),
+            outcome,
+            failure_category,
+        }
+    }
+
+    async fn persist(&self, record: AttemptRecord) -> Result<(), ()> {
+        if self
+            .configuration
+            .record_attempt(record.clone())
+            .await
+            .is_ok()
+        {
+            return Ok(());
+        }
+        let Some(spool) = &self.usage_spool else {
+            return Err(());
+        };
+        spool.append_attempt(record).await.map_err(|_| ())
+    }
+
+    async fn succeed(self) {
+        if self
+            .persist(self.record(AttemptOutcome::Succeeded, None))
+            .await
+            .is_ok()
+        {
+            let _ = self.configuration.mark_route_success(&self.route_id).await;
+        }
+    }
+
+    async fn fail(self, failure: ProviderFailure) {
+        let _ = self
+            .persist(self.record(
+                AttemptOutcome::PartialFailed,
+                Some(format!("{:?}", failure.category)),
+            ))
+            .await;
+        if failure.category.blocks_account() {
+            let _ = self
+                .configuration
+                .mark_account_failure(&self.provider_account_id, &failure)
+                .await;
+        }
+        if failure.category.opens_route() {
+            let _ = self
+                .configuration
+                .mark_route_failure(&self.route_id, &failure)
+                .await;
+        }
+    }
+
+    async fn cancel(self) {
+        let _ = self
+            .persist(self.record(AttemptOutcome::Cancelled, None))
+            .await;
+    }
+}
+
+type TerminalFuture = Pin<Box<dyn Future<Output = ()> + Send + 'static>>;
+
+struct ManagedInferenceStream<C: ConfigurationRepository + 'static> {
+    upstream: InferenceStream,
+    attempt: StreamAttempt<C>,
+    pending_terminal: Option<(InferenceStreamEvent, TerminalFuture)>,
+    terminal_emitted: bool,
+}
+
+impl<C: ConfigurationRepository + 'static> Unpin for ManagedInferenceStream<C> {}
+
+impl<C> futures_util::Stream for ManagedInferenceStream<C>
+where
+    C: ConfigurationRepository + 'static,
+{
+    type Item = InferenceStreamEvent;
+
+    fn poll_next(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        loop {
+            if self.terminal_emitted {
+                return Poll::Ready(None);
+            }
+            if let Some((_, future)) = self.pending_terminal.as_mut() {
+                if future.as_mut().poll(context).is_pending() {
+                    return Poll::Pending;
+                }
+                let (event, _) = self
+                    .pending_terminal
+                    .take()
+                    .expect("terminal future exists");
+                self.terminal_emitted = true;
+                return Poll::Ready(Some(event));
+            }
+            match self.upstream.as_mut().poll_next(context) {
+                Poll::Ready(Some(event @ InferenceStreamEvent::Frame(_))) => {
+                    return Poll::Ready(Some(event));
+                }
+                Poll::Ready(Some(event @ InferenceStreamEvent::Completed)) => {
+                    let attempt = self.attempt.clone();
+                    self.pending_terminal = Some((
+                        event,
+                        Box::pin(async move {
+                            attempt.succeed().await;
+                        }),
+                    ));
+                }
+                Poll::Ready(Some(event @ InferenceStreamEvent::Failed(_))) => {
+                    let InferenceStreamEvent::Failed(failure) = &event else {
+                        unreachable!();
+                    };
+                    let failure = failure.clone();
+                    let attempt = self.attempt.clone();
+                    self.pending_terminal = Some((
+                        event,
+                        Box::pin(async move {
+                            attempt.fail(failure).await;
+                        }),
+                    ));
+                }
+                Poll::Ready(None) => {
+                    let failure = sanitized_post_commit_failure();
+                    let event = InferenceStreamEvent::Failed(failure.clone());
+                    let attempt = self.attempt.clone();
+                    self.pending_terminal = Some((
+                        event,
+                        Box::pin(async move {
+                            attempt.fail(failure).await;
+                        }),
+                    ));
+                }
+                Poll::Pending => return Poll::Pending,
+            }
+        }
+    }
+}
+
+impl<C: ConfigurationRepository + 'static> Drop for ManagedInferenceStream<C> {
+    fn drop(&mut self) {
+        if self.terminal_emitted {
+            return;
+        }
+        let attempt = self.attempt.clone();
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                attempt.cancel().await;
+            });
+        }
+    }
+}
+
+fn sanitized_post_commit_failure() -> ProviderFailure {
+    ProviderFailure {
+        category: slg_domain::ErrorCategory::ProviderUnavailable,
+        message: "provider stream could not be completed".into(),
+        status: None,
+        retry_at_unix: None,
+    }
+}
+
 impl<C, E, S> Gateway<C, E, S>
 where
-    C: ConfigurationRepository,
+    C: ConfigurationRepository + 'static,
     E: InferenceExecutor,
     S: SecretResolver,
 {
@@ -148,6 +341,98 @@ where
             .await;
     }
 
+    async fn handle_execution(
+        &self,
+        request: &InferenceRequest,
+        route: slg_domain::RouteCandidate,
+        execution: InferenceExecution,
+    ) -> Result<InferenceResponse, ApplicationError> {
+        let attempt_id = AttemptId::new();
+        match execution {
+            InferenceExecution::Complete {
+                response,
+                authoritative_evidence,
+            } => {
+                self.persist_attempt(AttemptRecord {
+                    attempt_id: attempt_id.clone(),
+                    request_id: request.request_id.to_string(),
+                    route_id: route.route_id.clone(),
+                    outcome: AttemptOutcome::Succeeded,
+                    failure_category: None,
+                })
+                .await?;
+                self.configuration
+                    .mark_route_success(&route.route_id)
+                    .await
+                    .map_err(ApplicationError::Configuration)?;
+                if let Some(evidence) = authoritative_evidence {
+                    self.persist_authoritative_evidence(
+                        &route.provider_account_id,
+                        &attempt_id,
+                        *evidence,
+                    )
+                    .await;
+                }
+                Ok(InferenceResponse::Complete(response))
+            }
+            InferenceExecution::Streaming { body } => {
+                let attempt = StreamAttempt {
+                    configuration: self.configuration.clone(),
+                    usage_spool: self.usage_spool.clone(),
+                    attempt_id,
+                    request_id: request.request_id.to_string(),
+                    route_id: route.route_id,
+                    provider_account_id: route.provider_account_id,
+                };
+                attempt
+                    .persist(attempt.record(AttemptOutcome::Committed, None))
+                    .await
+                    .map_err(|()| {
+                        ApplicationError::Configuration(
+                            "control plane unavailable while persisting committed attempt".into(),
+                        )
+                    })?;
+                Ok(InferenceResponse::Streaming(Box::pin(
+                    ManagedInferenceStream {
+                        upstream: body,
+                        attempt,
+                        pending_terminal: None,
+                        terminal_emitted: false,
+                    },
+                )))
+            }
+        }
+    }
+
+    async fn handle_pre_commit_failure(
+        &self,
+        request: &InferenceRequest,
+        route: &slg_domain::RouteCandidate,
+        failure: &ProviderFailure,
+    ) -> Result<(), ApplicationError> {
+        self.persist_attempt(AttemptRecord {
+            attempt_id: AttemptId::new(),
+            request_id: request.request_id.to_string(),
+            route_id: route.route_id.clone(),
+            outcome: AttemptOutcome::Failed,
+            failure_category: Some(format!("{:?}", failure.category)),
+        })
+        .await?;
+        if failure.category.blocks_account() {
+            self.configuration
+                .mark_account_failure(&route.provider_account_id, failure)
+                .await
+                .map_err(ApplicationError::Configuration)?;
+        }
+        if failure.category.opens_route() {
+            self.configuration
+                .mark_route_failure(&route.route_id, failure)
+                .await
+                .map_err(ApplicationError::Configuration)?;
+        }
+        Ok(())
+    }
+
     pub async fn infer(
         &self,
         raw_key: &str,
@@ -182,66 +467,10 @@ where
                 }
             };
             match self.executor.execute(&route, &request, &credential).await {
-                Ok(execution) => {
-                    let attempt_id = AttemptId::new();
-                    let outcome = match execution {
-                        InferenceExecution::Complete { .. } => "succeeded",
-                        InferenceExecution::Streaming { .. } => "committed",
-                    };
-                    self.persist_attempt(AttemptRecord {
-                        attempt_id: attempt_id.clone(),
-                        request_id: request.request_id.to_string(),
-                        route_id: route.route_id.clone(),
-                        outcome: outcome.into(),
-                        failure_category: None,
-                    })
-                    .await?;
-                    self.configuration
-                        .mark_route_success(&route.route_id)
-                        .await
-                        .map_err(ApplicationError::Configuration)?;
-                    return match execution {
-                        InferenceExecution::Complete {
-                            response,
-                            authoritative_evidence,
-                        } => {
-                            if let Some(evidence) = authoritative_evidence {
-                                self.persist_authoritative_evidence(
-                                    &route.provider_account_id,
-                                    &attempt_id,
-                                    *evidence,
-                                )
-                                .await;
-                            }
-                            Ok(InferenceResponse::Complete(response))
-                        }
-                        InferenceExecution::Streaming { body } => {
-                            Ok(InferenceResponse::Streaming(body))
-                        }
-                    };
-                }
+                Ok(execution) => return self.handle_execution(&request, route, execution).await,
                 Err(failure) => {
-                    let category = format!("{:?}", failure.category);
-                    self.persist_attempt(AttemptRecord {
-                        attempt_id: AttemptId::new(),
-                        request_id: request.request_id.to_string(),
-                        route_id: route.route_id.clone(),
-                        outcome: "failed".into(),
-                        failure_category: Some(category),
-                    })
-                    .await?;
-                    if failure.category.blocks_account() {
-                        self.configuration
-                            .mark_account_failure(&route.provider_account_id, &failure)
-                            .await
-                            .map_err(ApplicationError::Configuration)?;
-                    }
-                    if failure.category.opens_route() {
-                        self.configuration
-                            .mark_route_failure(&route.route_id, &failure)
-                            .await
-                            .map_err(ApplicationError::Configuration)?;
-                    }
+                    self.handle_pre_commit_failure(&request, &route, &failure)
+                        .await?;
                     last_failure = Some(failure.message);
                 }
             }
@@ -262,16 +491,17 @@ fn route_unavailable(error: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
-    use bytes::Bytes;
     use futures_util::{StreamExt, stream};
     use slg_domain::{
         AuthoritativeSource, CredentialReference, ErrorCategory, FixedDecimal,
         ProviderAuthoritativeEvidence, ProviderBillingEvidence, ProviderFailure,
         ProviderReportedQuantity, ProviderUnit, ProviderUnitKind, RouteCandidate,
     };
+    use tokio::sync::Notify;
     use uuid::Uuid;
 
     use super::*;
@@ -324,6 +554,94 @@ mod tests {
         }
     }
 
+    #[derive(Clone)]
+    struct LifecycleConfiguration {
+        candidates: Vec<RouteCandidate>,
+        attempts: Arc<Mutex<Vec<AttemptRecord>>>,
+        route_successes: Arc<AtomicUsize>,
+        route_failures: Arc<AtomicUsize>,
+        cancellation_recorded: Arc<Notify>,
+    }
+
+    impl LifecycleConfiguration {
+        fn new(route_id: &str) -> Self {
+            Self {
+                candidates: vec![route(route_id)],
+                attempts: Arc::new(Mutex::new(Vec::new())),
+                route_successes: Arc::new(AtomicUsize::new(0)),
+                route_failures: Arc::new(AtomicUsize::new(0)),
+                cancellation_recorded: Arc::new(Notify::new()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl ConfigurationRepository for LifecycleConfiguration {
+        async fn authenticate(&self, _: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+
+        async fn candidates(&self, _: &str) -> Result<Vec<RouteCandidate>, String> {
+            Ok(self.candidates.clone())
+        }
+
+        async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), String> {
+            let cancelled = attempt.outcome == AttemptOutcome::Cancelled;
+            self.attempts.lock().unwrap().push(attempt);
+            if cancelled {
+                self.cancellation_recorded.notify_one();
+            }
+            Ok(())
+        }
+
+        async fn mark_route_success(&self, _: &str) -> Result<(), String> {
+            self.route_successes.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn mark_route_failure(&self, _: &str, _: &ProviderFailure) -> Result<(), String> {
+            self.route_failures.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn mark_account_failure(&self, _: &str, _: &ProviderFailure) -> Result<(), String> {
+            Ok(())
+        }
+    }
+
+    struct LifecycleExecutor;
+
+    #[async_trait]
+    impl InferenceExecutor for LifecycleExecutor {
+        async fn execute(
+            &self,
+            route: &RouteCandidate,
+            _: &InferenceRequest,
+            _: &str,
+        ) -> Result<InferenceExecution, ProviderFailure> {
+            let frame = InferenceStreamEvent::Frame(serde_json::json!({
+                "choices": [{"delta": {"content": "one"}}]
+            }));
+            let body: InferenceStream = match route.route_id.as_str() {
+                "success-route" => Box::pin(stream::iter([frame, InferenceStreamEvent::Completed])),
+                "failure-route" => Box::pin(stream::iter([
+                    frame,
+                    InferenceStreamEvent::Failed(ProviderFailure {
+                        category: ErrorCategory::ProviderUnavailable,
+                        message: "sanitized stream failure".into(),
+                        status: None,
+                        retry_at_unix: None,
+                    }),
+                ])),
+                "cancel-route" => {
+                    Box::pin(stream::once(async move { frame }).chain(stream::pending()))
+                }
+                _ => panic!("unexpected lifecycle route"),
+            };
+            Ok(InferenceExecution::streaming(body))
+        }
+    }
+
     struct TestExecutor;
 
     #[async_trait]
@@ -344,10 +662,10 @@ mod tests {
             }
             if request.stream {
                 return Ok(InferenceExecution::streaming(Box::pin(stream::iter([
-                    Ok(Bytes::from_static(
-                        b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n",
-                    )),
-                    Ok(Bytes::from_static(b"data: [DONE]\n\n")),
+                    InferenceStreamEvent::Frame(serde_json::json!({
+                        "choices": [{"delta": {"content": "ok"}}]
+                    })),
+                    InferenceStreamEvent::Completed,
                 ]))));
             }
             Ok(InferenceExecution::without_evidence(
@@ -386,15 +704,23 @@ mod tests {
             self.calls.lock().unwrap().push(route.route_id.clone());
             if route.route_id == "committed-route" {
                 return Ok(InferenceExecution::streaming(Box::pin(stream::iter([
-                    Ok(Bytes::from_static(
-                        b"data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n",
-                    )),
-                    Err(slg_ports::InferenceStreamError),
+                    InferenceStreamEvent::Frame(serde_json::json!({
+                        "choices": [{"delta": {"content": "partial"}}]
+                    })),
+                    InferenceStreamEvent::Failed(ProviderFailure {
+                        category: ErrorCategory::ProviderUnavailable,
+                        message: "sanitized stream failure".into(),
+                        status: None,
+                        retry_at_unix: None,
+                    }),
                 ]))));
             }
-            Ok(InferenceExecution::streaming(Box::pin(stream::iter([Ok(
-                Bytes::from_static(b"data: fallback-must-not-run\n\n"),
-            )]))))
+            Ok(InferenceExecution::streaming(Box::pin(stream::iter([
+                InferenceStreamEvent::Frame(serde_json::json!({
+                    "choices": [{"delta": {"content": "fallback-must-not-run"}}]
+                })),
+                InferenceStreamEvent::Completed,
+            ]))))
         }
     }
 
@@ -581,7 +907,7 @@ mod tests {
 
         let attempts = spool.attempts.lock().unwrap();
         assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].outcome, "succeeded");
+        assert_eq!(attempts[0].outcome, AttemptOutcome::Succeeded);
         let serialized = serde_json::to_string(&attempts[0]).unwrap();
         assert!(!serialized.contains("prompt-that-must-not-be-spooled"));
         assert!(!serialized.contains("credential-that-must-not-be-spooled"));
@@ -605,8 +931,8 @@ mod tests {
 
         let attempts = spool.attempts.lock().unwrap();
         assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0].outcome, "failed");
-        assert_eq!(attempts[1].outcome, "succeeded");
+        assert_eq!(attempts[0].outcome, AttemptOutcome::Failed);
+        assert_eq!(attempts[1].outcome, AttemptOutcome::Succeeded);
         assert_ne!(attempts[0].attempt_id, attempts[1].attempt_id);
     }
 
@@ -635,11 +961,13 @@ mod tests {
         };
         let chunks = body.collect::<Vec<_>>().await;
         assert_eq!(chunks.len(), 2);
-        assert!(chunks.iter().all(Result::is_ok));
+        assert!(matches!(chunks[0], InferenceStreamEvent::Frame(_)));
+        assert_eq!(chunks[1], InferenceStreamEvent::Completed);
         let attempts = spool.attempts.lock().unwrap();
-        assert_eq!(attempts.len(), 2);
-        assert_eq!(attempts[0].outcome, "failed");
-        assert_eq!(attempts[1].outcome, "committed");
+        assert_eq!(attempts.len(), 3);
+        assert_eq!(attempts[0].outcome, AttemptOutcome::Failed);
+        assert_eq!(attempts[1].outcome, AttemptOutcome::Committed);
+        assert_eq!(attempts[2].outcome, AttemptOutcome::Succeeded);
     }
 
     #[tokio::test]
@@ -709,18 +1037,115 @@ mod tests {
         else {
             panic!("expected a streaming response");
         };
-        assert!(body.next().await.unwrap().is_ok());
-        assert!(body.next().await.unwrap().is_err());
+        assert!(matches!(
+            body.next().await,
+            Some(InferenceStreamEvent::Frame(_))
+        ));
+        assert!(matches!(
+            body.next().await,
+            Some(InferenceStreamEvent::Failed(_))
+        ));
         assert_eq!(
             executor.calls.lock().unwrap().as_slice(),
             ["committed-route"]
         );
         let attempts = spool.attempts.lock().unwrap();
-        assert_eq!(attempts.len(), 1);
-        assert_eq!(attempts[0].outcome, "committed");
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, AttemptOutcome::Committed);
+        assert_eq!(attempts[1].outcome, AttemptOutcome::PartialFailed);
         let serialized = serde_json::to_string(&attempts[0]).unwrap();
         assert!(!serialized.contains("partial"));
         assert!(!serialized.contains("prompt-that-must-not-be-spooled"));
+    }
+
+    #[tokio::test]
+    async fn route_success_and_succeeded_transition_wait_for_done() {
+        let configuration = LifecycleConfiguration::new("success-route");
+        let gateway = Gateway::new(configuration.clone(), LifecycleExecutor, TestSecrets);
+        let mut streaming_request = request();
+        streaming_request.stream = true;
+        let InferenceResponse::Streaming(mut body) = gateway
+            .infer("gateway-key", streaming_request)
+            .await
+            .unwrap()
+        else {
+            panic!("expected streaming response");
+        };
+
+        assert_eq!(configuration.route_successes.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            configuration.attempts.lock().unwrap()[0].outcome,
+            AttemptOutcome::Committed
+        );
+        assert!(matches!(
+            body.next().await,
+            Some(InferenceStreamEvent::Frame(_))
+        ));
+        assert_eq!(configuration.route_successes.load(Ordering::SeqCst), 0);
+        assert_eq!(body.next().await, Some(InferenceStreamEvent::Completed));
+        assert_eq!(configuration.route_successes.load(Ordering::SeqCst), 1);
+        let attempts = configuration.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[1].outcome, AttemptOutcome::Succeeded);
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_transitions_committed_attempt_to_cancelled() {
+        let configuration = LifecycleConfiguration::new("cancel-route");
+        let gateway = Gateway::new(configuration.clone(), LifecycleExecutor, TestSecrets);
+        let mut streaming_request = request();
+        streaming_request.stream = true;
+        let InferenceResponse::Streaming(mut body) = gateway
+            .infer("gateway-key", streaming_request)
+            .await
+            .unwrap()
+        else {
+            panic!("expected streaming response");
+        };
+        assert!(matches!(
+            body.next().await,
+            Some(InferenceStreamEvent::Frame(_))
+        ));
+        drop(body);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            configuration.cancellation_recorded.notified(),
+        )
+        .await
+        .expect("cancelled transition was not persisted");
+
+        let attempts = configuration.attempts.lock().unwrap();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(attempts[0].outcome, AttemptOutcome::Committed);
+        assert_eq!(attempts[1].outcome, AttemptOutcome::Cancelled);
+        assert_eq!(configuration.route_successes.load(Ordering::SeqCst), 0);
+        assert_eq!(configuration.route_failures.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn post_commit_provider_failure_updates_future_route_state() {
+        let configuration = LifecycleConfiguration::new("failure-route");
+        let gateway = Gateway::new(configuration.clone(), LifecycleExecutor, TestSecrets);
+        let mut streaming_request = request();
+        streaming_request.stream = true;
+        let InferenceResponse::Streaming(body) = gateway
+            .infer("gateway-key", streaming_request)
+            .await
+            .unwrap()
+        else {
+            panic!("expected streaming response");
+        };
+        let events = body.collect::<Vec<_>>().await;
+        assert!(matches!(
+            events.as_slice(),
+            [
+                InferenceStreamEvent::Frame(_),
+                InferenceStreamEvent::Failed(_)
+            ]
+        ));
+        assert_eq!(configuration.route_failures.load(Ordering::SeqCst), 1);
+        let attempts = configuration.attempts.lock().unwrap();
+        assert_eq!(attempts[1].outcome, AttemptOutcome::PartialFailed);
     }
 
     #[tokio::test]

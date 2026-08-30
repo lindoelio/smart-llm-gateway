@@ -199,8 +199,9 @@ impl DurableUsageSpool {
     }
 
     pub fn append(&self, attempt: AttemptRecord) -> Result<String, String> {
+        let transition = attempt.outcome.as_str();
         let entry = SpoolEntry {
-            id: attempt.attempt_id.to_string(),
+            id: format!("{}:{transition}", attempt.attempt_id),
             attempt,
         };
         let payload = serde_json::to_string(&entry).map_err(|error| error.to_string())?;
@@ -545,8 +546,10 @@ fn restrict_path(_: &Path) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    #[derive(Clone)]
-    struct AcknowledgingRepository;
+    #[derive(Clone, Default)]
+    struct AcknowledgingRepository {
+        attempts: Arc<Mutex<Vec<AttemptRecord>>>,
+    }
 
     #[async_trait]
     impl ConfigurationRepository for AcknowledgingRepository {
@@ -558,7 +561,11 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn record_attempt(&self, _: AttemptRecord) -> Result<(), String> {
+        async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), String> {
+            self.attempts
+                .lock()
+                .map_err(|_| "acknowledging repository mutex poisoned".to_owned())?
+                .push(attempt);
             Ok(())
         }
 
@@ -651,28 +658,52 @@ mod tests {
         assert!(!path.exists());
     }
 
-    #[test]
-    fn spool_delivers_at_least_once_until_acknowledged() {
+    #[tokio::test]
+    async fn spool_retains_committed_and_terminal_transitions_across_restart() {
         let path = path("spool");
         let spool = DurableUsageSpool::open(&path).unwrap();
-        let attempt = AttemptRecord {
+        let committed = AttemptRecord {
             attempt_id: slg_domain::AttemptId::new(),
             request_id: "request".into(),
             route_id: "route".into(),
-            outcome: "succeeded".into(),
+            outcome: slg_ports::AttemptOutcome::Committed,
             failure_category: None,
         };
-        let id = spool.append(attempt.clone()).unwrap();
-        // The same outcome can be re-enqueued after a crash/retry, but must
-        // retain one durable item until the primary store acknowledges it.
-        assert_eq!(spool.append(attempt).unwrap(), id);
+        let committed_id = spool.append(committed.clone()).unwrap();
+        assert_eq!(spool.append(committed.clone()).unwrap(), committed_id);
+        let mut terminal = committed;
+        terminal.outcome = slg_ports::AttemptOutcome::PartialFailed;
+        terminal.failure_category = Some("ProviderUnavailable".into());
+        let terminal_id = spool.append(terminal).unwrap();
+        assert_ne!(committed_id, terminal_id);
         drop(spool);
 
         let recovered = DurableUsageSpool::open(&path).unwrap();
         let pending = recovered.pending(10).unwrap();
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, id);
-        recovered.acknowledge(&[id]).unwrap();
+        assert_eq!(pending.len(), 2);
+        assert_eq!(
+            pending[0].attempt.outcome,
+            slg_ports::AttemptOutcome::Committed
+        );
+        assert_eq!(
+            pending[1].attempt.outcome,
+            slg_ports::AttemptOutcome::PartialFailed
+        );
+        let serialized = serde_json::to_string(&pending).unwrap();
+        assert!(!serialized.contains("prompt"));
+        assert!(!serialized.contains("credential"));
+        let primary = AcknowledgingRepository::default();
+        assert_eq!(
+            flush_usage_spool(&recovered, &primary, 10).await.unwrap(),
+            2
+        );
+        let delivered = primary.attempts.lock().unwrap();
+        assert_eq!(delivered[0].outcome, slg_ports::AttemptOutcome::Committed);
+        assert_eq!(
+            delivered[1].outcome,
+            slg_ports::AttemptOutcome::PartialFailed
+        );
+        drop(delivered);
         assert!(recovered.pending(10).unwrap().is_empty());
         drop(recovered);
         fs::remove_file(path).unwrap();
@@ -695,18 +726,15 @@ mod tests {
                 attempt_id: slg_domain::AttemptId::new(),
                 request_id: "attempt-a".into(),
                 route_id: "route-a".into(),
-                outcome: "succeeded".into(),
+                outcome: slg_ports::AttemptOutcome::Succeeded,
                 failure_category: None,
             })
             .await
             .unwrap();
         assert_eq!(spool.pending(10).unwrap().len(), 1);
-        assert_eq!(
-            flush_usage_spool(&spool, &AcknowledgingRepository, 10)
-                .await
-                .unwrap(),
-            1
-        );
+        let primary = AcknowledgingRepository::default();
+        assert_eq!(flush_usage_spool(&spool, &primary, 10).await.unwrap(), 1);
+        assert_eq!(primary.attempts.lock().unwrap().len(), 1);
         assert!(spool.pending(10).unwrap().is_empty());
         fs::remove_file(spool_path).unwrap();
     }

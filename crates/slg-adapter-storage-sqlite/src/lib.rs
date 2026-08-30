@@ -150,7 +150,7 @@ fn migrate_schema(connection: &Connection) -> Result<(), String> {
              CREATE TABLE IF NOT EXISTS model_fallbacks (source_model TEXT NOT NULL REFERENCES logical_models(name), target_model TEXT NOT NULL REFERENCES logical_models(name), priority INTEGER NOT NULL, PRIMARY KEY(source_model, priority));
              CREATE TABLE IF NOT EXISTS provider_route_state (route_id TEXT PRIMARY KEY REFERENCES provider_routes(id), state TEXT NOT NULL DEFAULT 'closed', reason TEXT, retry_at INTEGER);
              CREATE TABLE IF NOT EXISTS provider_account_state (account_id TEXT PRIMARY KEY REFERENCES provider_accounts(id), state TEXT NOT NULL DEFAULT 'unknown', reason TEXT, retry_at INTEGER);
-             CREATE TABLE IF NOT EXISTS usage_attempts (id TEXT PRIMARY KEY, request_id TEXT NOT NULL, route_id TEXT NOT NULL, outcome TEXT NOT NULL, failure_category TEXT, observed_at INTEGER NOT NULL DEFAULT (unixepoch()));
+             CREATE TABLE IF NOT EXISTS usage_attempts (id TEXT PRIMARY KEY, request_id TEXT NOT NULL, route_id TEXT NOT NULL, outcome TEXT NOT NULL CHECK (outcome IN ('failed', 'committed', 'succeeded', 'partial_failed', 'cancelled')), failure_category TEXT, observed_at INTEGER NOT NULL DEFAULT (unixepoch()));
              CREATE TABLE IF NOT EXISTS provider_quota_snapshots (id TEXT PRIMARY KEY, provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id), constraint_id TEXT NOT NULL, unit_kind TEXT NOT NULL, currency_code TEXT, custom_name TEXT, allowance_unscaled INTEGER, allowance_scale INTEGER, consumed_unscaled INTEGER, consumed_scale INTEGER, remaining_unscaled INTEGER, remaining_scale INTEGER, reset_at INTEGER, observed_at INTEGER NOT NULL, fresh_until INTEGER NOT NULL, source_id TEXT NOT NULL CHECK (length(trim(source_id)) > 0), evidence_version TEXT, CHECK (fresh_until >= observed_at), CHECK (allowance_unscaled IS NOT NULL OR consumed_unscaled IS NOT NULL OR remaining_unscaled IS NOT NULL), CHECK ((allowance_unscaled IS NULL) = (allowance_scale IS NULL)), CHECK ((consumed_unscaled IS NULL) = (consumed_scale IS NULL)), CHECK ((remaining_unscaled IS NULL) = (remaining_scale IS NULL)), CHECK ((unit_kind = 'currency' AND currency_code GLOB '[A-Z][A-Z][A-Z]' AND custom_name IS NULL) OR (unit_kind = 'custom' AND length(trim(custom_name)) > 0 AND currency_code IS NULL) OR (unit_kind IN ('requests', 'input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens', 'concurrent_requests') AND currency_code IS NULL AND custom_name IS NULL)));
              CREATE TABLE IF NOT EXISTS provider_billing_records (id TEXT PRIMARY KEY, attempt_id TEXT NOT NULL REFERENCES usage_attempts(id), provider_account_id TEXT NOT NULL REFERENCES provider_accounts(id), provider_request_id TEXT, charge_unit_kind TEXT, charge_currency_code TEXT, charge_custom_name TEXT, charge_unscaled INTEGER, charge_scale INTEGER, observed_at INTEGER NOT NULL, fresh_until INTEGER NOT NULL, source_id TEXT NOT NULL CHECK (length(trim(source_id)) > 0), evidence_version TEXT, CHECK (fresh_until >= observed_at), CHECK ((charge_unscaled IS NULL) = (charge_scale IS NULL)), CHECK ((charge_unscaled IS NULL AND charge_unit_kind IS NULL AND charge_currency_code IS NULL AND charge_custom_name IS NULL) OR (charge_unscaled IS NOT NULL AND charge_unit_kind = 'currency' AND charge_currency_code GLOB '[A-Z][A-Z][A-Z]' AND charge_custom_name IS NULL)));
              CREATE TABLE IF NOT EXISTS provider_billing_units (billing_record_id TEXT NOT NULL REFERENCES provider_billing_records(id), unit_index INTEGER NOT NULL CHECK (unit_index >= 0), unit_kind TEXT NOT NULL, currency_code TEXT, custom_name TEXT, value_unscaled INTEGER NOT NULL, value_scale INTEGER NOT NULL, PRIMARY KEY (billing_record_id, unit_index), CHECK ((unit_kind = 'currency' AND currency_code GLOB '[A-Z][A-Z][A-Z]' AND custom_name IS NULL) OR (unit_kind = 'custom' AND length(trim(custom_name)) > 0 AND currency_code IS NULL) OR (unit_kind IN ('requests', 'input_tokens', 'cached_input_tokens', 'output_tokens', 'reasoning_tokens', 'total_tokens', 'concurrent_requests') AND currency_code IS NULL AND custom_name IS NULL)));",
@@ -224,7 +224,45 @@ impl SqliteStore {
     }
 
     fn record_attempt_internal(&self, attempt: &AttemptRecord) -> Result<(), String> {
-        self.connection.lock().map_err(|_| "sqlite mutex poisoned".to_owned())?.execute("INSERT INTO usage_attempts (id, request_id, route_id, outcome, failure_category) VALUES (?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO NOTHING", params![attempt.attempt_id.to_string(), attempt.request_id, attempt.route_id, attempt.outcome, attempt.failure_category]).map_err(|error| error.to_string())?;
+        let connection = self
+            .connection
+            .lock()
+            .map_err(|_| "sqlite mutex poisoned".to_owned())?;
+        let attempt_id = attempt.attempt_id.to_string();
+        connection
+            .execute(
+                "INSERT INTO usage_attempts (id, request_id, route_id, outcome, failure_category)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+               outcome = excluded.outcome,
+               failure_category = excluded.failure_category
+             WHERE usage_attempts.request_id = excluded.request_id
+               AND usage_attempts.route_id = excluded.route_id
+               AND usage_attempts.outcome = 'committed'
+               AND excluded.outcome IN ('succeeded', 'partial_failed', 'cancelled')",
+                params![
+                    attempt_id,
+                    attempt.request_id,
+                    attempt.route_id,
+                    attempt.outcome.as_str(),
+                    attempt.failure_category
+                ],
+            )
+            .map_err(|error| error.to_string())?;
+        let identity_matches = connection
+            .query_row(
+                "SELECT request_id = ?2 AND route_id = ?3 FROM usage_attempts WHERE id = ?1",
+                params![
+                    attempt.attempt_id.to_string(),
+                    attempt.request_id,
+                    attempt.route_id
+                ],
+                |row| row.get::<_, bool>(0),
+            )
+            .map_err(|error| error.to_string())?;
+        if !identity_matches {
+            return Err("attempt identity does not match the persisted attempt".into());
+        }
         Ok(())
     }
 
@@ -697,7 +735,7 @@ fn fixed_decimal(
 mod tests {
     use rusqlite::params;
     use slg_domain::AttemptId;
-    use slg_ports::AttemptRecord;
+    use slg_ports::{AttemptOutcome, AttemptRecord};
 
     use super::SqliteStore;
     use slg_ports::ConfigurationRepository;
@@ -767,27 +805,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recording_the_same_attempt_is_idempotent() {
+    async fn attempt_transitions_are_monotonic_and_idempotent() {
         let store = SqliteStore::in_memory().unwrap();
-        let attempt = AttemptRecord {
+        let committed = AttemptRecord {
             attempt_id: AttemptId::new(),
             request_id: "request".into(),
             route_id: "route".into(),
-            outcome: "succeeded".into(),
+            outcome: AttemptOutcome::Committed,
             failure_category: None,
         };
 
-        store.record_attempt(attempt.clone()).await.unwrap();
-        store.record_attempt(attempt.clone()).await.unwrap();
+        store.record_attempt(committed.clone()).await.unwrap();
+        let mut succeeded = committed.clone();
+        succeeded.outcome = AttemptOutcome::Succeeded;
+        store.record_attempt(succeeded.clone()).await.unwrap();
+        store.record_attempt(succeeded).await.unwrap();
+        let mut stale_failure = committed.clone();
+        stale_failure.outcome = AttemptOutcome::PartialFailed;
+        stale_failure.failure_category = Some("ProviderUnavailable".into());
+        store.record_attempt(stale_failure).await.unwrap();
 
         let connection = store.connection.lock().unwrap();
-        let count: i64 = connection
+        let (count, outcome, failure_category): (i64, String, Option<String>) = connection
             .query_row(
-                "SELECT COUNT(*) FROM usage_attempts WHERE id = ?1",
-                [attempt.attempt_id.to_string()],
-                |row| row.get(0),
+                "SELECT COUNT(*), outcome, failure_category FROM usage_attempts WHERE id = ?1",
+                [committed.attempt_id.to_string()],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
         assert_eq!(count, 1);
+        assert_eq!(outcome, "succeeded");
+        assert_eq!(failure_category, None);
     }
 }

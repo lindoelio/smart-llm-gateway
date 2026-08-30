@@ -6,16 +6,15 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+futures-util.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 slg-domain = { path = "../slg-domain" }
 slg-ports = { path = "../slg-ports" }
+tokio.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-bytes.workspace = true
-futures-util.workspace = true
-tokio.workspace = true
 uuid.workspace = true
 
 [lints]

@@ -63,7 +63,9 @@ CREATE TABLE usage_attempts (
   id TEXT PRIMARY KEY,
   request_id TEXT NOT NULL,
   route_id TEXT NOT NULL,
-  outcome TEXT NOT NULL,
+  outcome TEXT NOT NULL CHECK (
+    outcome IN ('failed', 'committed', 'succeeded', 'partial_failed', 'cancelled')
+  ),
   failure_category TEXT,
   observed_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
 );

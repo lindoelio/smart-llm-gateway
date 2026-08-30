@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 axum.workspace = true
 bytes.workspace = true
+futures-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 slg-application = { path = "../slg-application" }
@@ -19,4 +20,4 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
-futures-util.workspace = true
+tokio.workspace = true

@@ -62,7 +62,7 @@ CREATE TABLE IF NOT EXISTS provider_account_state (
   account_id TEXT PRIMARY KEY REFERENCES provider_accounts(id), state TEXT NOT NULL DEFAULT 'unknown' CHECK (state IN ('unknown', 'available', 'blocked')), reason TEXT, retry_at BIGINT
 );
 CREATE TABLE IF NOT EXISTS usage_attempts (
-  id TEXT PRIMARY KEY, request_id TEXT NOT NULL, route_id TEXT NOT NULL, outcome TEXT NOT NULL, failure_category TEXT, observed_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
+  id TEXT PRIMARY KEY, request_id TEXT NOT NULL, route_id TEXT NOT NULL, outcome TEXT NOT NULL CHECK (outcome IN ('failed', 'committed', 'succeeded', 'partial_failed', 'cancelled')), failure_category TEXT, observed_at BIGINT NOT NULL DEFAULT EXTRACT(EPOCH FROM NOW())::BIGINT
 );
 CREATE TABLE IF NOT EXISTS provider_route_probe_leases (
   route_id TEXT PRIMARY KEY REFERENCES provider_routes(id), lease_id TEXT NOT NULL, expires_at BIGINT NOT NULL
@@ -543,7 +543,40 @@ impl ConfigurationRepository for PostgresStore {
     }
 
     async fn record_attempt(&self, attempt: AttemptRecord) -> Result<(), String> {
-        self.client.lock().await.execute("INSERT INTO usage_attempts (id, request_id, route_id, outcome, failure_category) VALUES ($1, $2, $3, $4, $5) ON CONFLICT (id) DO NOTHING", &[&attempt.attempt_id.to_string(), &attempt.request_id, &attempt.route_id, &attempt.outcome, &attempt.failure_category]).await.map_err(|error| error.to_string())?;
+        let attempt_id = attempt.attempt_id.to_string();
+        let client = self.client.lock().await;
+        client
+            .execute(
+                "INSERT INTO usage_attempts (id, request_id, route_id, outcome, failure_category)
+                 VALUES ($1, $2, $3, $4, $5)
+                 ON CONFLICT (id) DO UPDATE SET
+                   outcome = EXCLUDED.outcome,
+                   failure_category = EXCLUDED.failure_category
+                 WHERE usage_attempts.request_id = EXCLUDED.request_id
+                   AND usage_attempts.route_id = EXCLUDED.route_id
+                   AND usage_attempts.outcome = 'committed'
+                   AND EXCLUDED.outcome IN ('succeeded', 'partial_failed', 'cancelled')",
+                &[
+                    &attempt_id,
+                    &attempt.request_id,
+                    &attempt.route_id,
+                    &attempt.outcome.as_str(),
+                    &attempt.failure_category,
+                ],
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let identity_matches: bool = client
+            .query_one(
+                "SELECT request_id = $2 AND route_id = $3 FROM usage_attempts WHERE id = $1",
+                &[&attempt_id, &attempt.request_id, &attempt.route_id],
+            )
+            .await
+            .map_err(|error| error.to_string())?
+            .get(0);
+        if !identity_matches {
+            return Err("attempt identity does not match the persisted attempt".into());
+        }
         Ok(())
     }
 
@@ -1109,32 +1142,43 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn postgres_records_the_same_attempt_once() {
+    async fn postgres_attempt_transitions_are_monotonic_and_idempotent() {
         let Some(url) = integration_url() else {
             return;
         };
         let store = PostgresStore::connect(&url).await.unwrap();
-        let attempt = AttemptRecord {
+        let committed = AttemptRecord {
             attempt_id: slg_domain::AttemptId::new(),
             request_id: unique("attempt-request"),
             route_id: unique("attempt-route"),
-            outcome: "succeeded".into(),
+            outcome: slg_ports::AttemptOutcome::Committed,
             failure_category: None,
         };
 
-        store.record_attempt(attempt.clone()).await.unwrap();
-        store.record_attempt(attempt.clone()).await.unwrap();
+        store.record_attempt(committed.clone()).await.unwrap();
+        let mut partial = committed.clone();
+        partial.outcome = slg_ports::AttemptOutcome::PartialFailed;
+        partial.failure_category = Some("ProviderUnavailable".into());
+        store.record_attempt(partial.clone()).await.unwrap();
+        store.record_attempt(partial).await.unwrap();
+        let mut stale_success = committed.clone();
+        stale_success.outcome = slg_ports::AttemptOutcome::Succeeded;
+        store.record_attempt(stale_success).await.unwrap();
 
         let client = store.client.lock().await;
-        let count: i64 = client
+        let row = client
             .query_one(
-                "SELECT COUNT(*) FROM usage_attempts WHERE id = $1",
-                &[&attempt.attempt_id.to_string()],
+                "SELECT COUNT(*), MIN(outcome), MIN(failure_category) FROM usage_attempts WHERE id = $1",
+                &[&committed.attempt_id.to_string()],
             )
             .await
-            .unwrap()
-            .get(0);
-        assert_eq!(count, 1);
+            .unwrap();
+        assert_eq!(row.get::<_, i64>(0), 1);
+        assert_eq!(row.get::<_, String>(1), "partial_failed");
+        assert_eq!(
+            row.get::<_, Option<String>>(2).as_deref(),
+            Some("ProviderUnavailable")
+        );
     }
 
     #[tokio::test]
@@ -1154,7 +1198,7 @@ mod tests {
             attempt_id: AttemptId::new(),
             request_id: unique("accounting-request"),
             route_id: route,
-            outcome: "succeeded".into(),
+            outcome: slg_ports::AttemptOutcome::Succeeded,
             failure_category: None,
         };
         postgres.record_attempt(attempt.clone()).await.unwrap();

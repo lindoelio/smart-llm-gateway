@@ -6,8 +6,14 @@ rust-version.workspace = true
 publish = false
 
 [dependencies]
+bytes.workspace = true
+futures-util.workspace = true
 serde_json.workspace = true
 slg-domain = { path = "../slg-domain" }
+slg-ports = { path = "../slg-ports" }
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+tokio.workspace = true

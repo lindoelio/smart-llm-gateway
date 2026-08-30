@@ -8,7 +8,7 @@ use slg_domain::{
     ProviderAuthoritativeEvidence, ProviderBillingEvidence, ProviderFailure,
     ProviderReportedQuantity, ProviderUnit, ProviderUnitKind, RouteCandidate,
 };
-use slg_ports::{InferenceExecution, InferenceExecutor, InferenceStreamError};
+use slg_ports::{InferenceExecution, InferenceExecutor};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Clone)]
@@ -67,10 +67,10 @@ impl InferenceExecutor for OpenAiCompatibleExecutor {
             return Err(classify(status, &body));
         }
         if request.stream {
-            let body = response
-                .bytes_stream()
-                .map(|chunk| chunk.map_err(|_| InferenceStreamError));
-            return Ok(InferenceExecution::streaming(Box::pin(body)));
+            let source = response.bytes_stream().map(|chunk| chunk.map_err(|_| ()));
+            return Ok(InferenceExecution::streaming(
+                slg_adapter_upstream_openai::decode_chat_completion_stream(Box::pin(source)),
+            ));
         }
         let body = response
             .json::<serde_json::Value>()
@@ -219,7 +219,8 @@ mod tests {
     use std::sync::Arc;
 
     use axum::{Router, body::Body, extract::State, response::Response, routing::post};
-    use futures_util::{TryStreamExt, stream};
+    use futures_util::{StreamExt, stream};
+    use slg_ports::InferenceStreamEvent;
     use tokio::sync::Notify;
 
     use super::*;
@@ -305,15 +306,10 @@ mod tests {
         let InferenceExecution::Streaming { body } = execution else {
             panic!("expected a streaming execution");
         };
-        let chunks = body.try_collect::<Vec<_>>().await.unwrap();
-        let proxied = chunks
-            .into_iter()
-            .flat_map(|chunk| chunk.to_vec())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            proxied,
-            b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n"
-        );
+        let events = body.collect::<Vec<_>>().await;
+        assert_eq!(events.len(), 2);
+        assert!(matches!(events[0], InferenceStreamEvent::Frame(_)));
+        assert_eq!(events[1], InferenceStreamEvent::Completed);
         server.abort();
     }
 
