@@ -20,4 +20,5 @@ uuid.workspace = true
 workspace = true
 
 [dev-dependencies]
+slg-adapter-upstream-openai = { path = "../slg-adapter-upstream-openai" }
 tokio.workspace = true

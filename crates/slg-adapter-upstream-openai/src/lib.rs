@@ -8,7 +8,7 @@ use bytes::Bytes;
 use futures_util::Stream;
 use serde_json::{Value, json};
 use slg_domain::{ErrorCategory, InferenceRequest, ProviderFailure};
-use slg_ports::{InferenceStream, InferenceStreamEvent};
+use slg_ports::{InferenceStream, InferenceStreamEvent, OpenAiChatCompletionChunk};
 
 /// Maximum bytes retained while waiting for one complete SSE frame.
 pub const MAX_SSE_FRAME_BYTES: usize = 256 * 1024;
@@ -141,10 +141,9 @@ fn decode_frame(frame: &[u8]) -> Result<Option<InferenceStreamEvent>, ErrorCateg
             error,
         ))));
     }
-    if !object.get("choices").is_some_and(Value::is_array) {
-        return Err(ErrorCategory::ProviderUnavailable);
-    }
-    Ok(Some(InferenceStreamEvent::Frame(value)))
+    let chunk = serde_json::from_value::<OpenAiChatCompletionChunk>(value)
+        .map_err(|_| ErrorCategory::ProviderUnavailable)?;
+    Ok(Some(InferenceStreamEvent::Frame(Box::new(chunk))))
 }
 
 fn sanitized_openai_error(error: &Value) -> ProviderFailure {
@@ -285,14 +284,30 @@ mod tests {
         else {
             panic!("expected the first frame incrementally");
         };
-        assert_eq!(
-            frame
-                .pointer("/choices/0/delta/content")
-                .and_then(Value::as_str),
-            Some("one")
-        );
+        assert_eq!(frame.choices[0].delta.content.as_deref(), Some("one"));
         release_done.notify_one();
         assert_eq!(events.next().await, Some(InferenceStreamEvent::Completed));
+    }
+
+    #[tokio::test]
+    async fn canonical_chunk_recursively_drops_unknown_secret_like_fields() {
+        let mut events = decode(vec![
+            Ok(br#"data: {"id":"chunk-1","object":"chat.completion.chunk","created":42,"model":"safe-model","diagnostic":"Bearer sk-live-root","choices":[{"index":0,"diagnostic":"sk-live-choice","delta":{"role":"assistant","content":"safe content","diagnostic":"sk-live-delta","tool_calls":[{"index":0,"id":"call-1","type":"function","diagnostic":"sk-live-tool","function":{"name":"lookup","arguments":"{\"city\":\"Sao Paulo\"}","diagnostic":"sk-live-function"}}]},"logprobs":{"content":[{"token":"safe","logprob":-0.5,"bytes":[115,97,102,101],"top_logprobs":[{"token":"safe","logprob":-0.5,"bytes":[115],"diagnostic":"sk-live-top"}],"diagnostic":"sk-live-token"}],"diagnostic":"sk-live-logprobs"},"finish_reason":null}],"usage":{"prompt_tokens":2,"completion_tokens":1,"total_tokens":3,"diagnostic":"sk-live-usage"}}"#),
+            Ok(b"\n\n"),
+        ]);
+
+        let Some(InferenceStreamEvent::Frame(chunk)) = events.next().await else {
+            panic!("expected a canonical frame");
+        };
+        let encoded = serde_json::to_string(&chunk).unwrap();
+        assert!(!encoded.contains("diagnostic"));
+        assert!(!encoded.contains("sk-live"));
+        assert!(!encoded.contains("Bearer"));
+        assert!(encoded.contains("safe content"));
+        assert!(encoded.contains("call-1"));
+        assert!(encoded.contains("lookup"));
+        assert!(encoded.contains(r#"{\"city\":\"Sao Paulo\"}"#));
+        assert!(encoded.contains("top_logprobs"));
     }
 
     #[tokio::test]

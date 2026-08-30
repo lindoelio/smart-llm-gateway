@@ -149,7 +149,9 @@ fn error(status: StatusCode, code: &str, message: &str) -> Response {
 #[cfg(test)]
 mod tests {
     use axum::{body::to_bytes, http::StatusCode};
+    use bytes::Bytes;
     use futures_util::stream;
+    use slg_adapter_upstream_openai::decode_chat_completion_stream;
     use slg_application::{ApplicationError, InferenceResponse};
     use slg_domain::{ErrorCategory, ProviderFailure};
     use slg_ports::{InferenceExecution, InferenceStreamEvent};
@@ -207,5 +209,29 @@ mod tests {
         assert!(text.contains("upstream_error"));
         assert!(!text.contains(raw));
         assert!(!text.contains("sk-live"));
+    }
+
+    #[tokio::test]
+    async fn emitted_sse_contains_only_recursively_allowlisted_chunk_fields() {
+        let source = stream::iter([
+            Ok(Bytes::from_static(
+                br#"data: {"id":"chunk-1","object":"chat.completion.chunk","created":42,"model":"safe-model","diagnostic":"Bearer sk-live-root","choices":[{"index":0,"diagnostic":"sk-live-choice","delta":{"content":"safe content","diagnostic":"sk-live-delta","tool_calls":[{"index":0,"id":"call-1","type":"function","diagnostic":"sk-live-tool","function":{"name":"lookup","arguments":"{\"city\":\"Sao Paulo\"}","diagnostic":"sk-live-function"}}]},"finish_reason":null}]}"#,
+            )),
+            Ok(Bytes::from_static(b"\n\ndata: [DONE]\n\n")),
+        ]);
+        let response = application_error_response(Ok(InferenceResponse::Streaming(
+            decode_chat_completion_stream(Box::pin(source)),
+        )));
+
+        let body = to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.contains("safe content"));
+        assert!(text.contains("call-1"));
+        assert!(text.contains("lookup"));
+        assert!(text.contains(r#"{\"city\":\"Sao Paulo\"}"#));
+        assert!(text.contains("data: [DONE]"));
+        assert!(!text.contains("diagnostic"));
+        assert!(!text.contains("sk-live"));
+        assert!(!text.contains("Bearer"));
     }
 }

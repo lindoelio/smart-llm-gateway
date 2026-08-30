@@ -505,7 +505,31 @@ mod tests {
     use uuid::Uuid;
 
     use super::*;
-    use slg_ports::InferenceExecution;
+    use slg_ports::{
+        InferenceExecution, OpenAiChatCompletionChoice, OpenAiChatCompletionChunk,
+        OpenAiChatCompletionDelta,
+    };
+
+    fn frame(content: &str) -> InferenceStreamEvent {
+        InferenceStreamEvent::Frame(Box::new(OpenAiChatCompletionChunk {
+            id: None,
+            object: None,
+            created: None,
+            model: None,
+            service_tier: None,
+            system_fingerprint: None,
+            choices: vec![OpenAiChatCompletionChoice {
+                index: None,
+                delta: OpenAiChatCompletionDelta {
+                    content: Some(content.into()),
+                    ..OpenAiChatCompletionDelta::default()
+                },
+                logprobs: None,
+                finish_reason: None,
+            }],
+            usage: None,
+        }))
+    }
 
     #[derive(Clone)]
     struct TestConfiguration {
@@ -619,9 +643,7 @@ mod tests {
             _: &InferenceRequest,
             _: &str,
         ) -> Result<InferenceExecution, ProviderFailure> {
-            let frame = InferenceStreamEvent::Frame(serde_json::json!({
-                "choices": [{"delta": {"content": "one"}}]
-            }));
+            let frame = frame("one");
             let body: InferenceStream = match route.route_id.as_str() {
                 "success-route" => Box::pin(stream::iter([frame, InferenceStreamEvent::Completed])),
                 "failure-route" => Box::pin(stream::iter([
@@ -662,9 +684,7 @@ mod tests {
             }
             if request.stream {
                 return Ok(InferenceExecution::streaming(Box::pin(stream::iter([
-                    InferenceStreamEvent::Frame(serde_json::json!({
-                        "choices": [{"delta": {"content": "ok"}}]
-                    })),
+                    frame("ok"),
                     InferenceStreamEvent::Completed,
                 ]))));
             }
@@ -704,9 +724,7 @@ mod tests {
             self.calls.lock().unwrap().push(route.route_id.clone());
             if route.route_id == "committed-route" {
                 return Ok(InferenceExecution::streaming(Box::pin(stream::iter([
-                    InferenceStreamEvent::Frame(serde_json::json!({
-                        "choices": [{"delta": {"content": "partial"}}]
-                    })),
+                    frame("partial"),
                     InferenceStreamEvent::Failed(ProviderFailure {
                         category: ErrorCategory::ProviderUnavailable,
                         message: "sanitized stream failure".into(),
@@ -716,9 +734,7 @@ mod tests {
                 ]))));
             }
             Ok(InferenceExecution::streaming(Box::pin(stream::iter([
-                InferenceStreamEvent::Frame(serde_json::json!({
-                    "choices": [{"delta": {"content": "fallback-must-not-run"}}]
-                })),
+                frame("fallback-must-not-run"),
                 InferenceStreamEvent::Completed,
             ]))))
         }

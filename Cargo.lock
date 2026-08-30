@@ -1365,6 +1365,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "slg-adapter-upstream-openai",
  "slg-application",
  "slg-domain",
  "slg-ports",

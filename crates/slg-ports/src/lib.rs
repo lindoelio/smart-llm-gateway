@@ -133,14 +133,143 @@ pub trait SecretResolver: Send + Sync {
 /// authoritative facts for operator inspection.
 pub type InferenceStream = Pin<Box<dyn Stream<Item = InferenceStreamEvent> + Send + 'static>>;
 
+/// Canonical, public OpenAI chat-completion chunk.
+///
+/// Deserialization intentionally ignores every field not declared here. This
+/// is the protocol allowlist: provider extensions cannot cross the port unless
+/// they are first represented by an explicitly reviewed, namespaced type.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct OpenAiChatCompletionChunk {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub object: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub created: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub service_tier: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub system_fingerprint: Option<String>,
+    pub choices: Vec<OpenAiChatCompletionChoice>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub usage: Option<OpenAiUsage>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct OpenAiChatCompletionChoice {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    pub delta: OpenAiChatCompletionDelta,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub logprobs: Option<OpenAiChoiceLogprobs>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OpenAiChatCompletionDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function_call: Option<OpenAiFunctionCallDelta>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_calls: Option<Vec<OpenAiToolCallDelta>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OpenAiFunctionCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub arguments: Option<String>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OpenAiToolCallDelta {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub function: Option<OpenAiFunctionCallDelta>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct OpenAiChoiceLogprobs {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<Vec<OpenAiTokenLogprob>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<Vec<OpenAiTokenLogprob>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct OpenAiTokenLogprob {
+    pub token: String,
+    pub logprob: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_logprobs: Vec<OpenAiTopLogprob>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct OpenAiTopLogprob {
+    pub token: String,
+    pub logprob: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OpenAiUsage {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_tokens_details: Option<OpenAiPromptTokensDetails>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub completion_tokens_details: Option<OpenAiCompletionTokensDetails>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OpenAiPromptTokensDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<u64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct OpenAiCompletionTokensDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audio_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted_prediction_tokens: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rejected_prediction_tokens: Option<u64>,
+}
+
 /// Typed events crossing the upstream/application boundary.
 ///
-/// Frames contain a validated complete OpenAI-compatible JSON object. A stream
-/// has exactly one terminal event: `[DONE]` becomes `Completed`; every other
-/// terminal condition becomes `Failed` with sanitized provider evidence.
+/// Frames contain only canonical, allowlisted OpenAI-compatible fields. A
+/// stream has exactly one terminal event: `[DONE]` becomes `Completed`; every
+/// other terminal condition becomes `Failed` with sanitized provider evidence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum InferenceStreamEvent {
-    Frame(serde_json::Value),
+    Frame(Box<OpenAiChatCompletionChunk>),
     Completed,
     Failed(ProviderFailure),
 }
