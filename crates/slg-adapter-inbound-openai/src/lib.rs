@@ -5,7 +5,7 @@ use std::sync::Arc;
 use axum::{
     Json, Router,
     body::Body,
-    extract::State,
+    extract::{State, rejection::JsonRejection},
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::post,
@@ -13,9 +13,9 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use slg_application::{ApplicationError, Gateway, InferenceResponse};
-use slg_domain::{ChatMessage, InferenceRequest};
+use slg_domain::{ChatMessage, InferenceRequest, MessageContent, MessageContentError};
 use slg_ports::{
     ConfigurationRepository, InferenceExecutor, InferenceStream, InferenceStreamEvent,
     SecretResolver,
@@ -30,6 +30,28 @@ struct ChatCompletionRequest {
     stream: bool,
     temperature: Option<f64>,
     max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireChatCompletionRequest {
+    model: String,
+    messages: Vec<WireChatMessage>,
+    #[serde(default)]
+    stream: bool,
+    temperature: Option<f64>,
+    max_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WireChatMessage {
+    role: String,
+    content: Value,
+}
+
+#[derive(Debug)]
+struct RequestError {
+    code: &'static str,
+    message: &'static str,
 }
 
 pub fn router<C, E, S>(gateway: Arc<Gateway<C, E, S>>) -> Router
@@ -50,7 +72,7 @@ where
 async fn chat_completion<C, E, S>(
     State(gateway): State<Arc<Gateway<C, E, S>>>,
     headers: HeaderMap,
-    Json(input): Json<ChatCompletionRequest>,
+    payload: Result<Json<Value>, JsonRejection>,
 ) -> Response
 where
     C: ConfigurationRepository + 'static,
@@ -64,6 +86,19 @@ where
             "Missing Bearer gateway key",
         );
     };
+    let input = match payload {
+        Ok(Json(value)) => match decode_request(value) {
+            Ok(input) => input,
+            Err(failure) => return error(StatusCode::BAD_REQUEST, failure.code, failure.message),
+        },
+        Err(_) => {
+            return error(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                "Malformed JSON request body",
+            );
+        }
+    };
     let request = InferenceRequest {
         request_id: Uuid::new_v4(),
         model: input.model,
@@ -73,6 +108,48 @@ where
         max_tokens: input.max_tokens,
     };
     application_error_response(gateway.infer(key, request).await)
+}
+
+fn decode_request(value: Value) -> Result<ChatCompletionRequest, RequestError> {
+    let request =
+        serde_json::from_value::<WireChatCompletionRequest>(value).map_err(|_| RequestError {
+            code: "invalid_request_error",
+            message: "Request body does not match the chat completions schema",
+        })?;
+    let messages = request
+        .messages
+        .into_iter()
+        .map(|message| {
+            MessageContent::try_from_json(message.content)
+                .map(|content| ChatMessage {
+                    role: message.role,
+                    content,
+                })
+                .map_err(content_error)
+        })
+        .collect::<Result<_, _>>()?;
+    Ok(ChatCompletionRequest {
+        model: request.model,
+        messages,
+        stream: request.stream,
+        temperature: request.temperature,
+        max_tokens: request.max_tokens,
+    })
+}
+
+fn content_error(error: MessageContentError) -> RequestError {
+    match error {
+        MessageContentError::UnsupportedPartType => RequestError {
+            code: "unsupported_content_part",
+            message: "Message content contains an unsupported part type",
+        },
+        MessageContentError::MalformedContent | MessageContentError::MalformedPart => {
+            RequestError {
+                code: "invalid_content_part",
+                message: "Message content contains a malformed part",
+            }
+        }
+    }
 }
 
 fn application_error_response(result: Result<InferenceResponse, ApplicationError>) -> Response {
@@ -151,12 +228,113 @@ mod tests {
     use axum::{body::to_bytes, http::StatusCode};
     use bytes::Bytes;
     use futures_util::stream;
+    use serde_json::json;
     use slg_adapter_upstream_openai::decode_chat_completion_stream;
     use slg_application::{ApplicationError, InferenceResponse};
-    use slg_domain::{ErrorCategory, ProviderFailure};
+    use slg_domain::{ErrorCategory, MessageContent, MessageContentPart, ProviderFailure};
     use slg_ports::{InferenceExecution, InferenceStreamEvent};
 
-    use super::{application_error_response, sanitized_upstream_message};
+    use super::{application_error_response, decode_request, sanitized_upstream_message};
+
+    #[test]
+    fn accepts_string_and_qwen_structured_text_content() {
+        let string = decode_request(json!({
+            "model": "logical-model",
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            string.messages[0].content,
+            MessageContent::Text("hello".into())
+        );
+
+        let qwen = decode_request(json!({
+            "model": "logical-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "first"},
+                    {"type": "text", "text": "second"}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            qwen.messages[0].content,
+            MessageContent::Parts(vec![
+                MessageContentPart::Text {
+                    text: "first".into()
+                },
+                MessageContentPart::Text {
+                    text: "second".into()
+                },
+            ])
+        );
+    }
+
+    #[test]
+    fn accepts_supported_mixed_multimodal_content_without_stringification() {
+        let request = decode_request(json!({
+            "model": "logical-model",
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "describe"},
+                    {"type": "image_url", "image_url": {
+                        "url": "data:image/png;base64,aW1hZ2U=", "detail": "high"
+                    }},
+                    {"type": "input_audio", "input_audio": {
+                        "data": "YXVkaW8=", "format": "wav"
+                    }}
+                ]
+            }]
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&request.messages[0].content).unwrap(),
+            json!([
+                {"type": "text", "text": "describe"},
+                {"type": "image_url", "image_url": {
+                    "url": "data:image/png;base64,aW1hZ2U=", "detail": "high"
+                }},
+                {"type": "input_audio", "input_audio": {
+                    "data": "YXVkaW8=", "format": "wav"
+                }}
+            ])
+        );
+    }
+
+    #[test]
+    fn malformed_and_unsupported_parts_return_deterministic_redacted_errors() {
+        let secret = "sk-live-client-secret-must-not-leak";
+        let malformed = decode_request(json!({
+            "model": "logical-model",
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": 42, "diagnostic": secret}
+            ]}]
+        }))
+        .unwrap_err();
+        assert_eq!(malformed.code, "invalid_content_part");
+        assert_eq!(
+            malformed.message,
+            "Message content contains a malformed part"
+        );
+        assert!(!malformed.message.contains(secret));
+
+        let unsupported = decode_request(json!({
+            "model": "logical-model",
+            "messages": [{"role": "user", "content": [
+                {"type": secret, "credential": secret}
+            ]}]
+        }))
+        .unwrap_err();
+        assert_eq!(unsupported.code, "unsupported_content_part");
+        assert_eq!(
+            unsupported.message,
+            "Message content contains an unsupported part type"
+        );
+        assert!(!unsupported.message.contains(secret));
+    }
 
     #[test]
     fn upstream_error_message_is_never_reflected_to_the_client() {

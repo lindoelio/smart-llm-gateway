@@ -242,6 +242,58 @@ mod tests {
         )))
     }
 
+    #[test]
+    fn outbound_encoding_preserves_string_and_structured_content_shapes() {
+        let request = InferenceRequest {
+            request_id: "00000000-0000-0000-0000-000000000000".parse().unwrap(),
+            model: "logical-model".into(),
+            messages: vec![
+                slg_domain::ChatMessage {
+                    role: "system".into(),
+                    content: "string content".into(),
+                },
+                slg_domain::ChatMessage {
+                    role: "user".into(),
+                    content: slg_domain::MessageContent::try_from_json(json!([
+                        {"type": "text", "text": "Qwen text"},
+                        {"type": "image_url", "image_url": {
+                            "url": "data:image/png;base64,aW1hZ2U=", "detail": "low"
+                        }},
+                        {"type": "input_audio", "input_audio": {
+                            "data": "YXVkaW8=", "format": "wav"
+                        }}
+                    ]))
+                    .unwrap(),
+                },
+            ],
+            stream: false,
+            temperature: Some(0.25),
+            max_tokens: Some(128),
+        };
+
+        assert_eq!(
+            encode_chat_completion(&request, "upstream-model"),
+            json!({
+                "model": "upstream-model",
+                "messages": [
+                    {"role": "system", "content": "string content"},
+                    {"role": "user", "content": [
+                        {"type": "text", "text": "Qwen text"},
+                        {"type": "image_url", "image_url": {
+                            "url": "data:image/png;base64,aW1hZ2U=", "detail": "low"
+                        }},
+                        {"type": "input_audio", "input_audio": {
+                            "data": "YXVkaW8=", "format": "wav"
+                        }}
+                    ]}
+                ],
+                "stream": false,
+                "temperature": 0.25,
+                "max_tokens": 128
+            })
+        );
+    }
+
     #[tokio::test]
     async fn fragmented_top_level_error_is_consumed_and_redacted() {
         let raw = "sk-live-provider-diagnostic-must-not-leak";

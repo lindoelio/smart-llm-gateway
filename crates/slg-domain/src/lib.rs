@@ -2,14 +2,189 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, de};
+use serde_json::{Map, Value};
 use thiserror::Error;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ChatMessage {
     pub role: String,
-    pub content: String,
+    pub content: MessageContent,
+}
+
+/// Canonical chat content. The untagged representation deliberately preserves
+/// the OpenAI string form while allowing typed multimodal parts without
+/// flattening payloads into text.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(untagged)]
+pub enum MessageContent {
+    Text(String),
+    Parts(Vec<MessageContentPart>),
+}
+
+impl MessageContent {
+    pub fn try_from_json(value: Value) -> Result<Self, MessageContentError> {
+        match value {
+            Value::String(text) => Ok(Self::Text(text)),
+            Value::Array(parts) if !parts.is_empty() => parts
+                .into_iter()
+                .map(|part| MessageContentPart::try_from_json(&part))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::Parts),
+            _ => Err(MessageContentError::MalformedContent),
+        }
+    }
+}
+
+impl From<String> for MessageContent {
+    fn from(value: String) -> Self {
+        Self::Text(value)
+    }
+}
+
+impl From<&str> for MessageContent {
+    fn from(value: &str) -> Self {
+        Self::Text(value.to_owned())
+    }
+}
+
+impl<'de> Deserialize<'de> for MessageContent {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Self::try_from_json(Value::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum MessageContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrlContent },
+    InputAudio { input_audio: InputAudioContent },
+}
+
+impl MessageContentPart {
+    fn try_from_json(value: &Value) -> Result<Self, MessageContentError> {
+        let object = value
+            .as_object()
+            .ok_or(MessageContentError::MalformedPart)?;
+        let part_type = object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or(MessageContentError::MalformedPart)?;
+        match part_type {
+            "text" => {
+                exact_keys(object, &["type", "text"])?;
+                let text = object
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .ok_or(MessageContentError::MalformedPart)?;
+                Ok(Self::Text {
+                    text: text.to_owned(),
+                })
+            }
+            "image_url" => {
+                exact_keys(object, &["type", "image_url"])?;
+                let image = object
+                    .get("image_url")
+                    .and_then(Value::as_object)
+                    .ok_or(MessageContentError::MalformedPart)?;
+                exact_keys(image, &["url", "detail"])?;
+                let url = non_empty_string(image, "url")?;
+                let detail = image
+                    .get("detail")
+                    .map(|value| {
+                        let value = value.as_str().ok_or(MessageContentError::MalformedPart)?;
+                        match value {
+                            "auto" => Ok(ImageDetail::Auto),
+                            "low" => Ok(ImageDetail::Low),
+                            "high" => Ok(ImageDetail::High),
+                            _ => Err(MessageContentError::MalformedPart),
+                        }
+                    })
+                    .transpose()?;
+                Ok(Self::ImageUrl {
+                    image_url: ImageUrlContent { url, detail },
+                })
+            }
+            "input_audio" => {
+                exact_keys(object, &["type", "input_audio"])?;
+                let audio = object
+                    .get("input_audio")
+                    .and_then(Value::as_object)
+                    .ok_or(MessageContentError::MalformedPart)?;
+                exact_keys(audio, &["data", "format"])?;
+                let data = non_empty_string(audio, "data")?;
+                let format = match audio.get("format").and_then(Value::as_str) {
+                    Some("wav") => AudioFormat::Wav,
+                    Some("mp3") => AudioFormat::Mp3,
+                    _ => return Err(MessageContentError::MalformedPart),
+                };
+                Ok(Self::InputAudio {
+                    input_audio: InputAudioContent { data, format },
+                })
+            }
+            _ => Err(MessageContentError::UnsupportedPartType),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ImageUrlContent {
+    pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<ImageDetail>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ImageDetail {
+    Auto,
+    Low,
+    High,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputAudioContent {
+    pub data: String,
+    pub format: AudioFormat,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioFormat {
+    Wav,
+    Mp3,
+}
+
+#[derive(Debug, Clone, Copy, Error, PartialEq, Eq)]
+pub enum MessageContentError {
+    #[error("message content must be a string or a non-empty array of supported parts")]
+    MalformedContent,
+    #[error("message content part is malformed")]
+    MalformedPart,
+    #[error("message content part type is unsupported")]
+    UnsupportedPartType,
+}
+
+fn exact_keys(object: &Map<String, Value>, allowed: &[&str]) -> Result<(), MessageContentError> {
+    object
+        .keys()
+        .all(|key| allowed.contains(&key.as_str()))
+        .then_some(())
+        .ok_or(MessageContentError::MalformedPart)
+}
+
+fn non_empty_string(object: &Map<String, Value>, key: &str) -> Result<String, MessageContentError> {
+    object
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .ok_or(MessageContentError::MalformedPart)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -510,6 +685,44 @@ pub fn candidate_plan(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn message_content_round_trips_string_and_supported_parts() {
+        let string: MessageContent = serde_json::from_value(serde_json::json!("hello")).unwrap();
+        assert_eq!(string, MessageContent::Text("hello".into()));
+
+        let parts_value = serde_json::json!([
+            {"type": "text", "text": "describe"},
+            {"type": "image_url", "image_url": {
+                "url": "data:image/png;base64,aW1hZ2U=", "detail": "auto"
+            }},
+            {"type": "input_audio", "input_audio": {
+                "data": "YXVkaW8=", "format": "mp3"
+            }}
+        ]);
+        let parts: MessageContent = serde_json::from_value(parts_value.clone()).unwrap();
+        assert_eq!(serde_json::to_value(parts).unwrap(), parts_value);
+    }
+
+    #[test]
+    fn message_content_rejects_unknown_or_non_allowlisted_part_shapes() {
+        assert_eq!(
+            MessageContent::try_from_json(serde_json::json!([
+                {"type": "input_file", "file": {"file_id": "secret"}}
+            ])),
+            Err(MessageContentError::UnsupportedPartType)
+        );
+        assert_eq!(
+            MessageContent::try_from_json(serde_json::json!([
+                {"type": "text", "text": "safe", "credential": "secret"}
+            ])),
+            Err(MessageContentError::MalformedPart)
+        );
+        assert_eq!(
+            MessageContent::try_from_json(serde_json::json!([])),
+            Err(MessageContentError::MalformedContent)
+        );
+    }
 
     fn route(model: &str, id: &str, priority: u32) -> RouteCandidate {
         RouteCandidate {
